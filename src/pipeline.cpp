@@ -380,7 +380,7 @@ static int64_t parse_date10(const char* p) {
 // (valid or not) in a small direct-mapped table keyed by the ten date bytes.
 struct DateMemo { uint64_t k8 = 0; uint16_t k2 = 0; int64_t days = BAD_DATE; }; // k8 = 0 never matches real text
 static thread_local DateMemo dateMemo[128];
-static inline int64_t date_days(const char* p) {
+__attribute__((always_inline)) static inline int64_t date_days(const char* p) {
     uint64_t k8; uint16_t k2; std::memcpy(&k8, p, 8); std::memcpy(&k2, p + 8, 2);
     DateMemo& m = dateMemo[((k8 ^ (uint64_t(k2) << 40)) * 0x9E3779B97F4A7C15ULL) >> 57];
     if (m.k8 == k8 && m.k2 == k2) return m.days;
@@ -424,7 +424,7 @@ static inline uint32_t digit_mask16(__m128i x) {
     const __m128i d = _mm_sub_epi8(x, _mm_set1_epi8('0'));
     return static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)));
 }
-static inline bool parse_f12_fast(const char* p, size_t n, int64_t& out) { // n is 20 or 25
+__attribute__((always_inline)) static inline bool parse_f12_fast(const char* p, size_t n, int64_t& out) { // n is 20 or 25
     alignas(16) static constexpr char H[16] = {0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0};
     // tail = the last 16 bytes: positions 4..19 (F1) or 9..24 (F2)
     alignas(16) static constexpr char TT[2][16] = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', 0, 0, 'Z'},
@@ -454,7 +454,7 @@ static inline bool parse_f12_fast(const char* p, size_t n, int64_t& out) { // n 
     out = (days * 86400 + hh * 3600 + mm * 60 + ss - int64_t(off) * 60) * 1000;
     return true;
 }
-static inline bool parse_timestamp(sv s, int64_t& out) {
+__attribute__((always_inline)) static inline bool parse_timestamp(sv s, int64_t& out) {
     const char* p = s.data(); const size_t n = s.size();
     if ((n == 20 || n == 25) && p[4] == '-') return parse_f12_fast(p, n, out);
     // F3: a string with '-' anywhere is never all digits, so the scalar order of checks is irrelevant
