@@ -31,20 +31,26 @@ Every stage runs on all cores and no hot loop takes a lock.
    (CAS; a root is only linked under a smaller index, so no cycles) → the byte-wise smallest name
    per component, found by a parallel CAS-min. Each ID-table entry is one 64-byte cache line holding
    the ID and its person's name, so resolving a `user_id` costs one memory access.
-2. **Events.** An AVX2 scanner finds `,` `"` `\n` 64 bytes at a time and applies the dialect rules
-   exactly. Each row is validated on the spot, since validity depends only on the row. Its person is
-   resolved while the bytes are still in cache, with ID-table and product lookups prefetched in
-   batches of 16. The row is then written (streaming stores, no read-for-ownership) to a
-   thread-local block list chosen by `hash(event_id)`.
+2. **Events.** A two-stage AVX2 scanner: stage 1 finds `,` `"` `\n` 64 bytes at a time and writes
+   every comma offset to an array, plus, per line end, how many commas and quotes precede it;
+   stage 2 walks whole lines (exactly N-1 commas; quotes checked per line by count) and applies the
+   dialect rules exactly. Timestamps are checked 16 bytes at a time (F1/F2 by template masks, F3 by
+   SWAR digit conversion). Each row is validated on the spot, since validity depends only on the
+   row, then written (streaming stores) to a thread-local block list chosen by `hash(event_id)`.
+   The link step runs on its own thread(s) meanwhile.
 3. **Dedup.** Each of 1024 event-ID partitions is deduplicated with a table that fits in L2:
-   the earliest `ingest_ts` wins, and the kept copy's validity decides, as the rules require.
-   Survivors go to one of 1024 person partitions chosen by `hash(person name)`.
+   the earliest `ingest_ts` wins, and the kept copy's validity decides, as the rules require. Losing
+   copies are marked in place, then the partition is read again in storage order; each survivor's
+   person is resolved (ID-table lookups prefetched in batches of 16) and it goes to one of 1024
+   person partitions chosen by `hash(person name)`.
 4. **Clicks.** Parsed, validated, resolved and sent straight to the person partitions. Copies of a
    click have identical values, so a duplicate can change neither the latest click nor the set of
    assisting campaigns: no click dedup is needed.
-5. **People.** Each person partition groups rows by exact name (counting sort), sorts each person's
-   events by `ts` and clicks by `(ts, click_id)`, then sweeps once: sessions, last-click credit with
-   the smallest-`click_id` tie-break, and the set of campaigns active in the 7-day window for assists.
+5. **People.** Each person partition gives every row a local person id (exact name), stably
+   radix-sorts all its events and clicks by `ts` (three 11-bit digits), then stably scatters them by
+   person, so every person's rows come out in `ts` order with no per-person sort. One sweep per
+   person then finds sessions, the last-click credit (among clicks at the latest qualifying `ts`, the
+   smallest `click_id`) and the set of campaigns active in the 7-day window for assists.
 6. **Output.** A small hand-written Parquet writer (PLAIN, uncompressed, `day` as `DATE`, nullable
    `top_category`). Each worker writes its own `user_daily/part-N.parquet`. Read back with Polars,
    pyarrow and DuckDB.
