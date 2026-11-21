@@ -1,2 +1,1 @@
 # BuildersDatabricksChallenge
-team ALGORithm
