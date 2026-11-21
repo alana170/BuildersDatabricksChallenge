@@ -238,6 +238,104 @@ static void scan_lines(sv chunk, Fn&& fn) {
     }
 }
 
+// Two-stage scan, same dialect and same result as scan_lines. Stage 1 runs over 64-byte blocks
+// and writes every comma offset into an array; for each '\n' it records the offset and how many
+// commas and quotes come before it. Stage 2 then walks whole lines: a line is well-formed only
+// with exactly N-1 commas, and its quotes are valid iff every field starts with a quote exactly
+// when it ends with one (length >= 2 when it does) and the line holds two quotes per such field.
+// (Each wrapped field owns its two boundary quotes, so any other quote makes the count too high.)
+template <size_t N, class Fn>
+static void scan_lines_fast(sv chunk, Fn&& fn) {
+    static_assert(N >= 2);
+    if (chunk.size() >= (size_t(1) << 32) - 128) { scan_lines<N>(chunk, fn); return; }
+    const char* base = chunk.data();
+    const uint32_t n = static_cast<uint32_t>(chunk.size());
+    constexpr uint32_t MAXL = 128;                                     // lines per stage-2 batch
+    static thread_local std::vector<uint32_t> cmv;
+    if (cmv.size() < 4096) cmv.resize(4096);
+    uint32_t* cm = cmv.data();
+    uint32_t cmN = 0, cmBase = 0;          // cm[i] holds comma number cmBase + i (counted in the chunk)
+    uint32_t totC = 0, totQ = 0;           // commas and quotes before the current block
+    uint32_t nlPos[MAXL + 64], nlC[MAXL + 64], nlQ[MAXL + 64]; uint32_t nl = 0;
+    uint32_t ls = 0, lc = 0, lq = 0;       // current line start: offset, commas and quotes before it
+    std::array<sv, N> f;
+    auto line = [&](uint32_t le, uint32_t c1, uint32_t q1) {
+        if (c1 - lc == N - 1) {
+            const uint32_t* c = cm + (lc - cmBase);
+            uint32_t s = ls;
+            if (q1 == lq) {
+                for (size_t i = 0; i + 1 < N; ++i) { f[i] = sv(base + s, c[i] - s); s = c[i] + 1; }
+                f[N - 1] = sv(base + s, le - s);
+                fn(f);
+            } else {
+                bool bad = false; uint32_t nq = 0;
+                for (size_t i = 0; i < N; ++i) {
+                    const uint32_t e = i + 1 < N ? c[i] : le;
+                    const uint32_t len = e - s;
+                    const bool qf = len >= 1 && base[s] == '"', qe = len >= 1 && base[e - 1] == '"';
+                    bad |= (qf != qe) | (qf & (len < 2));
+                    nq += qf;
+                    f[i] = sv(base + s + qf, len - 2 * qf * (len >= 2));
+                    s = e + 1;
+                }
+                if (!bad && 2 * nq == q1 - lq) fn(f);
+            }
+        }
+        ls = le + 1; lc = c1; lq = q1;
+    };
+    auto drain = [&] {
+        for (uint32_t k = 0; k < nl; ++k) line(nlPos[k], nlC[k], nlQ[k]);
+        nl = 0;
+        // keep only the commas of the unfinished line
+        const uint32_t drop = lc - cmBase;
+        if (drop) { std::memmove(cm, cm + drop, (cmN - drop) * sizeof(uint32_t)); cmN -= drop; cmBase = lc; }
+    };
+    alignas(64) char tail[64];
+    for (uint32_t off = 0; off < n; off += 64) {
+        uint64_t C, NL, Q;
+        const char* p = base + off;
+        if (n - off < 64) { std::memset(tail, 0, 64); std::memcpy(tail, p, n - off); p = tail; }
+#ifdef __AVX2__
+        {
+            const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
+            __m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            __m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+            auto mm = [](__m256i a, __m256i b, __m256i v) {
+                return (uint64_t(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)))) << 32) |
+                       static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)));
+            };
+            C = mm(x0, x1, vc); NL = mm(x0, x1, vn); Q = mm(x0, x1, vq);
+        }
+#else
+        C = NL = Q = 0;
+        for (int i = 0; i < 64; ++i) {
+            if (p[i] == ',') C |= uint64_t(1) << i;
+            if (p[i] == '\n') NL |= uint64_t(1) << i;
+            if (p[i] == '"') Q |= uint64_t(1) << i;
+        }
+#endif
+        if (cmN + 64 > cmv.size()) { cmv.resize(cmv.size() * 2); cm = cmv.data(); }
+        {
+            uint64_t m = C; uint32_t* out = cm + cmN; const uint32_t cnt = static_cast<uint32_t>(__builtin_popcountll(C));
+            for (int i = 0; i < 8; ++i) { out[i] = off + static_cast<uint32_t>(_tzcnt_u64(m)); m = _blsr_u64(m); }
+            if (cnt > 8) for (int i = 8; i < 64 && m; ++i) { out[i] = off + static_cast<uint32_t>(_tzcnt_u64(m)); m = _blsr_u64(m); }
+            cmN += cnt;
+        }
+        for (uint64_t m = NL; m; m = _blsr_u64(m)) {
+            const uint32_t b = static_cast<uint32_t>(_tzcnt_u64(m));
+            const uint64_t below = _bzhi_u64(~uint64_t(0), b);
+            nlPos[nl] = off + b;
+            nlC[nl] = totC + static_cast<uint32_t>(__builtin_popcountll(C & below));
+            nlQ[nl] = totQ + static_cast<uint32_t>(__builtin_popcountll(Q & below));
+            ++nl;
+        }
+        totC += static_cast<uint32_t>(__builtin_popcountll(C)); totQ += static_cast<uint32_t>(__builtin_popcountll(Q));
+        if (nl >= MAXL) drain();
+    }
+    drain();
+    if (ls < n) line(n, totC, totQ); // final line without '\n' (its last field may be empty)
+}
+
 // -------------------------------- timestamps -------------------------------
 static inline bool ascii_digits(sv s) {
     if (s.empty()) return false;
@@ -733,7 +831,7 @@ int main() {
             Mapping pm = map_file(data / "products.csv");
             std::vector<std::pair<sv, sv>> rows;
             for (sv c : make_chunks({pm}, size_t(1) << 40))
-                scan_lines<2>(c, [&](const std::array<sv, 2>& f) { if (!f[0].empty()) rows.emplace_back(f[0], f[1]); });
+                scan_lines_fast<2>(c, [&](const std::array<sv, 2>& f) { if (!f[0].empty()) rows.emplace_back(f[0], f[1]); });
             products.build(rows.size());
             for (auto& [pid, cat] : rows) {
                 auto it = catMap.find(std::string(cat));
@@ -754,7 +852,7 @@ int main() {
             Mapping cm = map_file(data / "campaigns.csv");
             std::vector<std::pair<sv, sv>> crow;
             for (sv c : make_chunks({cm}, size_t(1) << 40))
-                scan_lines<2>(c, [&](const std::array<sv, 2>& f) { if (!f[0].empty()) crow.emplace_back(f[0], f[1]); });
+                scan_lines_fast<2>(c, [&](const std::array<sv, 2>& f) { if (!f[0].empty()) crow.emplace_back(f[0], f[1]); });
             campaigns.build(crow.size());
             for (auto& [cid, ch] : crow)
                 if (campaigns.insert(cid, static_cast<uint32_t>(campNames.size()))) { campNames.emplace_back(cid); channels.emplace_back(ch); }
@@ -781,7 +879,7 @@ int main() {
             std::atomic<size_t> next{0};
             run_threads(TL, [&](unsigned t) {
                 for (size_t i; (i = next.fetch_add(1)) < chunks.size();)
-                    scan_lines<2>(chunks[i], [&](const std::array<sv, 2>& f) {
+                    scan_lines_fast<2>(chunks[i], [&](const std::array<sv, 2>& f) {
                         if (f[0].empty() || f[1].empty()) return;
                         uint64_t a = key_of(f[0]), b = key_of(f[1]);
                         pairs[t].emplace_back(a, b);
@@ -897,7 +995,7 @@ int main() {
                 run_threads(T, [&](unsigned t) {
                     Scatter<ERec, 4, 1024> sc; sc.init(&erec[t], &erecArena);
                     for (size_t i; (i = next.fetch_add(1)) < chunks.size();) {
-                        scan_lines<7>(chunks[i], [&](const std::array<sv, 7>& f) {
+                        scan_lines_fast<7>(chunks[i], [&](const std::array<sv, 7>& f) {
                             if (f[0].empty()) return;
                             int64_t ingest;
                             if (!parse_f1(f[3], ingest)) return; // ingest_ts is always valid F1
@@ -942,12 +1040,20 @@ int main() {
                         size_t cap = 16; while (cap < n * 2) cap <<= 1;
                         slots.assign(cap, Slot{0, nullptr});
                         const uint64_t mask = cap - 1;
+                        // Pass 1: the copy that loses (later ingest_ts; on a tie the later-read copy)
+                        // is marked in place with person = NO_KEY, so it is never emitted.
                         for (unsigned w = 0; w < T; ++w)
-                            erec[w][p].each([&](const ERec& r) {
+                            erec[w][p].each([&](const ERec& cr) {
+                                ERec& r = const_cast<ERec&>(cr); // arena memory owned by this pass
                                 for (uint64_t q = khash(r.eid) & mask;; q = (q + 1) & mask) {
                                     Slot& s = slots[q];
                                     if (!s.r) { s.eid = r.eid; s.r = &r; break; }
-                                    if (s.eid == r.eid) { if (r.ingest < s.r->ingest) s.r = &r; break; } // earliest ingest_ts wins
+                                    if (s.eid == r.eid) { // earliest ingest_ts wins
+                                        ERec* cur = const_cast<ERec*>(s.r);
+                                        if (r.ingest < cur->ingest) { cur->person = NO_KEY; s.r = &r; }
+                                        else r.person = NO_KEY;
+                                        break;
+                                    }
                                 }
                             });
                         const ERec* pend[BATCH]; uint64_t ph[BATCH]; int npend = 0;
@@ -958,11 +1064,13 @@ int main() {
                             }
                             npend = 0;
                         };
-                        for (const Slot& s : slots) {
-                            if (!s.r || s.r->person == NO_KEY) continue; // the kept copy decides
-                            ph[npend] = khash(s.r->person); id_prefetch(ph[npend]); pend[npend++] = s.r;
-                            if (npend == BATCH) drain();
-                        }
+                        // Pass 2, in storage order: what is left is each event's kept copy, if valid.
+                        for (unsigned w = 0; w < T; ++w)
+                            erec[w][p].each([&](const ERec& r) {
+                                if (r.person == NO_KEY) return; // a losing copy, or an invalid kept copy
+                                ph[npend] = khash(r.person); id_prefetch(ph[npend]); pend[npend++] = &r;
+                                if (npend == BATCH) drain();
+                            });
                         drain();
                     }
                     sc.finish();
@@ -989,7 +1097,7 @@ int main() {
                     npend = 0;
                 };
                 for (size_t i; (i = next.fetch_add(1)) < chunks.size();) {
-                    scan_lines<4>(chunks[i], [&](const std::array<sv, 4>& f) {
+                    scan_lines_fast<4>(chunks[i], [&](const std::array<sv, 4>& f) {
                         if (f[0].empty() || f[1].empty()) return;
                         int64_t ts;
                         if (!parse_timestamp(f[3], ts) || ts < cws || ts >= we) return;
