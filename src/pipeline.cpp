@@ -724,6 +724,23 @@ struct BlockList {
 };
 
 template <class T> using Grid = std::vector<std::vector<std::vector<T>>>; // [worker][partition]
+
+// Append-only list that hands out a stable address for each pushed row.
+template <class T, uint32_t B>
+struct RefList {
+    struct Blk { Blk* next; uint32_t n; alignas(64) T items[B]; };
+    Blk* head = nullptr; Blk* tail = nullptr; size_t total = 0;
+    inline T* push(const T& v, SlabAlloc& al) {
+        if (!tail || tail->n == B) {
+            Blk* b = static_cast<Blk*>(al.get(sizeof(Blk))); b->next = nullptr; b->n = 0;
+            if (tail) tail->next = b; else head = b;
+            tail = b;
+        }
+        T* d = &tail->items[tail->n++]; *d = v; ++total; return d;
+    }
+    template <class F> inline void each(F&& f) const { for (Blk* b = head; b; b = b->next) for (uint32_t i = 0; i < b->n; ++i) f(b->items[i]); }
+    size_t size() const { return total; }
+};
 template <class T, uint32_t B> using BGrid = std::vector<std::vector<BlockList<T, B>>>;
 
 // ------------------------------- record types ------------------------------
@@ -734,6 +751,35 @@ struct PEv { uint64_t person; uint32_t ts, price_cat; };                        
 struct PCl { uint64_t person, cid; uint32_t ts, camp; };                          // 24 bytes
 static_assert(sizeof(ERec) == 32 && sizeof(PEv) == 16 && sizeof(PCl) == 24);
 static inline uint32_t part_of(uint64_t h, int bits) { return static_cast<uint32_t>(h >> (64 - bits)); }
+
+// A person partition's events: rows, plus each row's ingest_ts in a parallel array that is read
+// only if the row's event_id turns out to have other copies. push returns a reference to the row:
+// block address | index << 48 (user-space addresses fit in 47 bits).
+struct PList {
+    static constexpr uint32_t B = 1024;
+    struct Blk { Blk* next; uint32_t n; alignas(64) PEv items[B]; int64_t ingest[B]; };
+    Blk* head = nullptr; Blk* tail = nullptr; size_t total = 0;
+    inline uint64_t push(const PEv& v, int64_t ingest, SlabAlloc& al) {
+        if (!tail || tail->n == B) {
+            Blk* b = static_cast<Blk*>(al.get(sizeof(Blk))); b->next = nullptr; b->n = 0;
+            if (reinterpret_cast<uintptr_t>(b) >> 47) throw std::runtime_error("unexpected address layout");
+            if (tail) tail->next = b; else head = b;
+            tail = b;
+        }
+        const uint32_t i = tail->n++;
+        tail->items[i] = v; tail->ingest[i] = ingest; ++total;
+        return reinterpret_cast<uintptr_t>(tail) | (uint64_t(i) << 48);
+    }
+    static inline Blk* blk(uint64_t ref) { return reinterpret_cast<Blk*>(ref & ((uint64_t(1) << 48) - 1)); }
+    static inline PEv& row(uint64_t ref) { return blk(ref)->items[ref >> 48]; }
+    static inline int64_t ingest_of(uint64_t ref) { return blk(ref)->ingest[ref >> 48]; }
+    template <class F> inline void each(F&& f) const { for (Blk* b = head; b; b = b->next) for (uint32_t i = 0; i < b->n; ++i) f(b->items[i]); }
+    size_t size() const { return total; }
+};
+// A copy that is not the first of its event_id to be claimed (or arrived after the table filled):
+// kept in full for the fix-up. person == NO_KEY means the copy is invalid.
+struct Side { uint64_t eid, person; int64_t ingest; uint32_t ts, price_cat; };
+static_assert(sizeof(Side) == 32);
 
 // Write-combining scatter: records for each partition are staged in a cache-line-aligned
 // buffer of K records and leave it with non-temporal stores, so no destination line is ever
@@ -969,114 +1015,155 @@ int main() {
             fprintf(stderr, "links: ids=%u\n", G);
         }
         };
-        const unsigned TL = std::max(1u, T / 4);
-        std::exception_ptr linkErr;
-        std::thread linkThread([&] { try { run_links(TL); } catch (...) { linkErr = std::current_exception(); } });
+        // Events go straight to their person's partition, so the ID table must be complete first.
+        run_links(T);
 
         size_t eventBytes = 0, clickBytes = 0;
         std::vector<Mapping> eventMaps = map_csv_dir(data / "events"), clickMaps = map_csv_dir(data / "clicks");
         eventBytes = total_bytes(eventMaps); clickBytes = total_bytes(clickMaps);
         // ~70 bytes per generated event line, ~45 per click line; arenas fall back to malloc if short
-        Arena erecArena, pevArena, pclArena;
-        erecArena.init(eventBytes / 70 * sizeof(ERec) * 5 / 4 + Arena::SLAB * 4 * T);
-        pevArena.init(eventBytes / 70 * sizeof(PEv) * 5 / 4 + Arena::SLAB * 4 * T);
+        Arena pevArena, sideArena, pclArena;
+        pevArena.init(eventBytes / 70 * (sizeof(PList::Blk) / PList::B) * 5 / 4 + size_t(T) * NP * sizeof(PList::Blk) + Arena::SLAB * 4 * T);
+        sideArena.init(eventBytes / 70 * sizeof(Side) / 8 + Arena::SLAB * 4 * T);
         pclArena.init(clickBytes / 45 * sizeof(PCl) * 5 / 4 + Arena::SLAB * 4 * T);
-        BGrid<PEv, 2048> pev(T, std::vector<BlockList<PEv, 2048>>(NP));
+        std::vector<std::vector<PList>> pev(T, std::vector<PList>(NP));
         BGrid<PCl, 1024> pcl(T, std::vector<BlockList<PCl, 1024>>(NP));
         constexpr int BATCH = 16; // rows whose hash-table lines are prefetched together
 
-        // ---- events: parse + validate + partition by event_id ----
+        // ---- events: one pass. Parse, validate, resolve the person and claim the event_id. ----
+        // The global event_id table: key 0 = empty (no packed or interned key is 0), so the fresh
+        // zero pages need no initialisation. ref is the claiming copy's row (valid) or the address
+        // of its ingest_ts with bit 0 set (invalid). Copies that find the key taken go to `side`.
+        struct ESlot { std::atomic<uint64_t> k; uint64_t ref; };
+        static_assert(sizeof(ESlot) == 16);
+        const uint64_t ecap = std::max<uint64_t>(1024, eventBytes / 45);
+        const uint64_t elimit = ecap / 100 * 85;   // past this many claims, rows only go to `side`
+        ESlot* etab;
         {
-            BGrid<ERec, 1024> erec(T, std::vector<BlockList<ERec, 1024>>(ND));
-            {
-                Phase ph("events_parse");
-                auto chunks = make_chunks(eventMaps, chunk_bytes(4u << 20));
-                std::atomic<size_t> next{0};
-                run_threads(T, [&](unsigned t) {
-                    Scatter<ERec, 4, 1024> sc; sc.init(&erec[t], &erecArena);
-                    for (size_t i; (i = next.fetch_add(1)) < chunks.size();) {
-                        scan_lines_fast<7>(chunks[i], [&](const std::array<sv, 7>& f) {
-                            if (f[0].empty()) return;
-                            int64_t ingest;
-                            if (!parse_f1(f[3], ingest)) return; // ingest_ts is always valid F1
-                            ERec r;
-                            r.eid = key_of(f[0]); r.ingest = ingest; r.person = NO_KEY; r.ts = 0; r.price_cat = 0;
-                            const uint32_t part = part_of(khash(r.eid), ND_BITS);
-                            int64_t ts; bool valid = false; uint32_t price = 0;
-                            do {
-                                if (f[1].empty() || f[5].empty()) break;
-                                if (!parse_timestamp(f[2], ts) || ts < ws || ts >= we) break;
-                                sv ty = f[4];
-                                if (ty == "purchase") {
-                                    uint64_t p;
-                                    if (!parse_u64_ascii(f[6], p) || p < 1 || p > 10'000'000) break;
-                                    price = static_cast<uint32_t>(p);
-                                } else if (ty != "view" && ty != "cart") break;
-                                if (ingest - ts > LATE_MS) break;
-                                valid = true;
-                            } while (false);
-                            if (valid) {
-                                r.person = key_of(f[1]); // raw user key; resolved to the person in dedup
-                                r.ts = static_cast<uint32_t>(ts - cws);
-                                if (price) { int64_t c = products.find(f[5]); r.price_cat = price | static_cast<uint32_t>(c < 0 ? 0 : c) << 24; } // 0 = unknown
-                            }
-                            sc.push(part, r);
-                        });
-                    }
-                    sc.finish();
-                });
-            }
-            {
-                { Phase pj("links_join"); linkThread.join(); if (linkErr) std::rethrow_exception(linkErr); }
-                Phase ph("events_dedup");
-                std::atomic<uint32_t> np{0};
-                run_threads(T, [&](unsigned t) {
-                    Scatter<PEv, 8, 2048> sc; sc.init(&pev[t], &pevArena);
-                    struct Slot { uint64_t eid; const ERec* r; };
-                    std::vector<Slot> slots;
-                    for (uint32_t p; (p = np.fetch_add(1)) < ND;) {
-                        size_t n = 0; for (unsigned w = 0; w < T; ++w) n += erec[w][p].size();
-                        if (!n) continue;
-                        size_t cap = 16; while (cap < n * 2) cap <<= 1;
-                        slots.assign(cap, Slot{0, nullptr});
-                        const uint64_t mask = cap - 1;
-                        // Pass 1: the copy that loses (later ingest_ts; on a tie the later-read copy)
-                        // is marked in place with person = NO_KEY, so it is never emitted.
-                        for (unsigned w = 0; w < T; ++w)
-                            erec[w][p].each([&](const ERec& cr) {
-                                ERec& r = const_cast<ERec&>(cr); // arena memory owned by this pass
-                                for (uint64_t q = khash(r.eid) & mask;; q = (q + 1) & mask) {
-                                    Slot& s = slots[q];
-                                    if (!s.r) { s.eid = r.eid; s.r = &r; break; }
-                                    if (s.eid == r.eid) { // earliest ingest_ts wins
-                                        ERec* cur = const_cast<ERec*>(s.r);
-                                        if (r.ingest < cur->ingest) { cur->person = NO_KEY; s.r = &r; }
-                                        else r.person = NO_KEY;
-                                        break;
-                                    }
+            void* m = ::mmap(nullptr, ecap * sizeof(ESlot), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (m == MAP_FAILED) throw std::runtime_error("mmap failed: event_id table");
+            ::madvise(m, ecap * sizeof(ESlot), MADV_HUGEPAGE);
+            etab = static_cast<ESlot*>(m);
+        }
+        auto eslot = [&](uint64_t h) { return ((h & 0xFFFFFFFFu) * ecap) >> 32; };
+        std::vector<RefList<Side, 1024>> side(T);
+        std::vector<RefList<int64_t, 4096>> invIngest(T);
+        std::vector<SlabAlloc> pevAl(T);
+        for (unsigned t = 0; t < T; ++t) pevAl[t].a = &pevArena;
+        {
+            Phase ph("events_parse");
+            auto chunks = make_chunks(eventMaps, chunk_bytes(4u << 20));
+            std::atomic<size_t> next{0};
+            std::atomic<uint64_t> claims{0};
+            std::atomic<bool> full{false};
+            run_threads(T, [&](unsigned t) {
+                SlabAlloc& al = pevAl[t];
+                SlabAlloc sal; sal.a = &sideArena;
+                std::vector<PList>& mine = pev[t];
+                struct Pd { uint64_t eid, eh, uk, uh; int64_t ingest; uint32_t ts, pc; bool valid; };
+                Pd pend[BATCH]; int npend = 0; uint64_t localClaims = 0;
+                auto drain = [&] {
+                    for (int k = 0; k < npend; ++k) {
+                        const Pd& x = pend[k];
+                        const uint64_t person = x.valid ? resolve_h(x.uk, x.uh) : NO_KEY;
+                        ESlot* slot = nullptr;
+                        if (!full.load(std::memory_order_relaxed)) {
+                            for (uint64_t q = eslot(x.eh);;) {
+                                uint64_t cur = etab[q].k.load(std::memory_order_relaxed);
+                                if (cur == 0) {
+                                    if (etab[q].k.compare_exchange_strong(cur, x.eid, std::memory_order_relaxed)) { slot = &etab[q]; break; }
                                 }
-                            });
-                        const ERec* pend[BATCH]; uint64_t ph[BATCH]; int npend = 0;
-                        auto drain = [&] {
-                            for (int k = 0; k < npend; ++k) {
-                                const uint64_t person = resolve_h(pend[k]->person, ph[k]);
-                                sc.push(part_of(khash(person), NP_BITS), PEv{person, pend[k]->ts, pend[k]->price_cat});
+                                if (cur == x.eid) break; // another copy holds the key
+                                if (++q == ecap) q = 0;
                             }
-                            npend = 0;
-                        };
-                        // Pass 2, in storage order: what is left is each event's kept copy, if valid.
-                        for (unsigned w = 0; w < T; ++w)
-                            erec[w][p].each([&](const ERec& r) {
-                                if (r.person == NO_KEY) return; // a losing copy, or an invalid kept copy
-                                ph[npend] = khash(r.person); id_prefetch(ph[npend]); pend[npend++] = &r;
-                                if (npend == BATCH) drain();
-                            });
-                        drain();
+                        }
+                        if (slot) {
+                            if (x.valid) slot->ref = mine[part_of(khash(person), NP_BITS)].push(PEv{person, x.ts, x.pc}, x.ingest, al);
+                            else slot->ref = reinterpret_cast<uintptr_t>(invIngest[t].push(x.ingest, sal)) | 1;
+                            if (++localClaims == 1024) {
+                                if (claims.fetch_add(localClaims, std::memory_order_relaxed) + localClaims > elimit) full.store(true, std::memory_order_relaxed);
+                                localClaims = 0;
+                            }
+                        } else {
+                            side[t].push(Side{x.eid, person, x.ingest, x.ts, x.pc}, sal);
+                        }
                     }
-                    sc.finish();
-                });
-            }
-            erecArena.release();
+                    npend = 0;
+                };
+                for (size_t i; (i = next.fetch_add(1)) < chunks.size();) {
+                    scan_lines_fast<7>(chunks[i], [&](const std::array<sv, 7>& f) {
+                        if (f[0].empty()) return;
+                        int64_t ingest;
+                        if (!parse_f1(f[3], ingest)) return; // ingest_ts is always valid F1
+                        Pd& x = pend[npend];
+                        x.eid = key_of(f[0]); x.eh = khash(x.eid); x.ingest = ingest; x.ts = 0; x.pc = 0;
+                        __builtin_prefetch(&etab[eslot(x.eh)]);
+                        int64_t ts; bool valid = false; uint32_t price = 0;
+                        do {
+                            if (f[1].empty() || f[5].empty()) break;
+                            if (!parse_timestamp(f[2], ts) || ts < ws || ts >= we) break;
+                            sv ty = f[4];
+                            if (ty == "purchase") {
+                                uint64_t p;
+                                if (!parse_u64_ascii(f[6], p) || p < 1 || p > 10'000'000) break;
+                                price = static_cast<uint32_t>(p);
+                            } else if (ty != "view" && ty != "cart") break;
+                            if (ingest - ts > LATE_MS) break;
+                            valid = true;
+                        } while (false);
+                        x.valid = valid;
+                        if (valid) {
+                            x.uk = key_of(f[1]); x.uh = khash(x.uk); id_prefetch(x.uh);
+                            x.ts = static_cast<uint32_t>(ts - cws);
+                            if (price) { int64_t c = products.find(f[5]); x.pc = price | static_cast<uint32_t>(c < 0 ? 0 : c) << 24; } // 0 = unknown
+                        }
+                        if (++npend == BATCH) drain();
+                    });
+                }
+                drain();
+            });
+        }
+        // ---- fix-up: event_ids with more than one copy (and rows that arrived after the table filled) ----
+        {
+            Phase ph("events_fixup");
+            constexpr int FB = 8; constexpr uint32_t NFB = 1u << FB;
+            Grid<const Side*> fb(T, std::vector<std::vector<const Side*>>(NFB));
+            run_threads(T, [&](unsigned t) { side[t].each([&](const Side& x) { fb[t][part_of(khash(x.eid), FB)].push_back(&x); }); });
+            std::atomic<uint32_t> nb{0};
+            run_threads(T, [&](unsigned t) {
+                struct G { uint64_t eid; const Side* best; };
+                std::vector<G> g;
+                for (uint32_t b; (b = nb.fetch_add(1)) < NFB;) {
+                    size_t n = 0; for (unsigned w = 0; w < T; ++w) n += fb[w][b].size();
+                    if (!n) continue;
+                    size_t cap = 16; while (cap < n * 2) cap <<= 1;
+                    g.assign(cap, G{0, nullptr});
+                    const uint64_t mask = cap - 1;
+                    for (unsigned w = 0; w < T; ++w)
+                        for (const Side* x : fb[w][b])
+                            for (uint64_t q = khash(x->eid) & mask;; q = (q + 1) & mask) {
+                                if (!g[q].best) { g[q] = G{x->eid, x}; break; }
+                                if (g[q].eid == x->eid) { if (x->ingest < g[q].best->ingest) g[q].best = x; break; } // earliest ingest_ts
+                            }
+                    for (const G& e : g) {
+                        if (!e.best) continue;
+                        uint64_t ref = 0; bool claimed = false;
+                        for (uint64_t q = eslot(khash(e.eid));;) {
+                            const uint64_t k = etab[q].k.load(std::memory_order_relaxed);
+                            if (k == e.eid) { ref = etab[q].ref; claimed = true; break; }
+                            if (k == 0) break;
+                            if (++q == ecap) q = 0;
+                        }
+                        if (claimed) {
+                            const int64_t first = (ref & 1) ? *reinterpret_cast<const int64_t*>(ref & ~uint64_t(1)) : PList::ingest_of(ref);
+                            if (first <= e.best->ingest) continue;   // the claimed copy is the kept one (equal ingest_ts: identical copies)
+                            if (!(ref & 1)) PList::row(ref).person = NO_KEY; // it loses: never counted
+                        }
+                        const Side& w = *e.best;                    // the kept copy decides
+                        if (w.person != NO_KEY) pev[t][part_of(khash(w.person), NP_BITS)].push(PEv{w.person, w.ts, w.price_cat}, w.ingest, pevAl[t]);
+                    }
+                }
+            });
         }
 
         // ---- clicks: parse + validate + resolve + partition by person ----
@@ -1168,16 +1255,18 @@ int main() {
                     };
                     // counting sort events by person
                     evPid.clear(); evPid.reserve(ne);
-                    for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { evPid.push_back(pid_of(e.person, true)); });
+                    for (unsigned w = 0; w < T; ++w) // a row marked NO_KEY lost dedup in the fix-up
+                        pev[w][p].each([&](const PEv& e) { evPid.push_back(e.person == NO_KEY ? 0xFFFFFFFFu : pid_of(e.person, true)); });
                     const size_t P = persons.size();
                     evOff.assign(P + 1, 0);
-                    for (uint32_t x : evPid) evOff[x + 1]++;
+                    for (uint32_t x : evPid) if (x != 0xFFFFFFFFu) evOff[x + 1]++;
                     for (size_t k = 0; k < P; ++k) evOff[k + 1] += evOff[k];
                     ev.resize(ne);
                     fill.assign(evOff.begin(), evOff.end() - 1);
                     {
                         size_t idx = 0;
-                        for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { ev[fill[evPid[idx++]]++] = EK{e.ts, e.price_cat}; });
+                        for (unsigned w = 0; w < T; ++w)
+                            pev[w][p].each([&](const PEv& e) { const uint32_t x = evPid[idx++]; if (x != 0xFFFFFFFFu) ev[fill[x]++] = EK{e.ts, e.price_cat}; });
                     }
                     // counting sort clicks by person (clicks of people without events are dropped)
                     clPid.clear(); clPid.reserve(nc);
