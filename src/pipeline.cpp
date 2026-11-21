@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -48,6 +49,11 @@ static void log_worker_timing(const char* phase, uint64_t elapsedNs) {
         std::chrono::nanoseconds(elapsedNs));
     std::cerr << "timing phase=" << phase << " elapsed_ms=" << elapsed.count()
               << " scope=summed_worker_time status=completed\n";
+}
+
+static double timing_ms(uint64_t elapsedNs) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::nanoseconds(elapsedNs)).count();
 }
 
 class PhaseTimer {
@@ -587,6 +593,50 @@ struct UserDayAgg {
 struct CampaignAgg {
     uint64_t sessions=0, purchasing=0, revenue=0, assisted=0;
 };
+struct BucketProfile {
+    uint64_t events=0, clicks=0, people=0, sessions=0, boundaryChecks=0;
+    uint64_t clickAdvances=0, userRows=0, eventBufferBytes=0, clickBufferBytes=0;
+    uint64_t workingStateBytes=0;
+    uint64_t eventSortNs=0, clickSortNs=0, processNs=0;
+    uint64_t setupNs=0, personIndexNs=0, processPersonNs=0, eventLoopNs=0;
+    uint64_t sessionBoundaryNs=0, sessionBeginNs=0, attributionNs=0;
+    uint64_t clickAdvanceNs=0, sessionFinishNs=0, userOutputNs=0, finalizeNs=0;
+    bool detailed=false;
+};
+
+static void log_bucket_profile(int bucket, const BucketProfile& profile) {
+    std::ostringstream line;
+    line << "timing phase=bucket_detail bucket_id=" << bucket
+         << " events=" << profile.events
+         << " clicks=" << profile.clicks
+         << " people=" << profile.people
+         << " sessions=" << profile.sessions
+         << " boundary_checks=" << profile.boundaryChecks
+         << " click_advances=" << profile.clickAdvances
+         << " user_rows=" << profile.userRows
+         << " event_sort_ms=" << timing_ms(profile.eventSortNs)
+         << " click_sort_ms=" << timing_ms(profile.clickSortNs)
+         << " bucket_process_ms=" << timing_ms(profile.processNs);
+    if (profile.detailed) {
+        line << " event_buffer_bytes=" << profile.eventBufferBytes
+             << " click_buffer_bytes=" << profile.clickBufferBytes
+             << " working_state_bytes=" << profile.workingStateBytes
+             << " bucket_setup_ms=" << timing_ms(profile.setupNs)
+             << " person_index_ms=" << timing_ms(profile.personIndexNs)
+             << " process_person_ms=" << timing_ms(profile.processPersonNs)
+             << " event_loop_inclusive_ms=" << timing_ms(profile.eventLoopNs)
+             << " session_boundary_ms=" << timing_ms(profile.sessionBoundaryNs)
+             << " session_begin_inclusive_ms=" << timing_ms(profile.sessionBeginNs)
+             << " attribution_inclusive_ms=" << timing_ms(profile.attributionNs)
+             << " click_advance_ms=" << timing_ms(profile.clickAdvanceNs)
+             << " session_finish_ms=" << timing_ms(profile.sessionFinishNs)
+             << " user_output_ms=" << timing_ms(profile.userOutputNs)
+             << " output_finalize_ms=" << timing_ms(profile.finalizeNs);
+    }
+    line << " status=completed";
+    logmsg(line.str());
+}
+
 struct SessionState {
     int64_t start=0;
     uint32_t day=0;
@@ -616,7 +666,8 @@ static void process_person(
     std::vector<int32_t>& campaignPosition,
     std::vector<uint32_t>& activeCampaigns,
     uint32_t generation,
-    const std::vector<std::string>& dayStrings
+    const std::vector<std::string>& dayStrings,
+    BucketProfile& profile
 ) {
     if (dayCount > 32) throw std::runtime_error("window longer than 32 days");
 
@@ -630,6 +681,8 @@ static void process_person(
     const std::string& personName = users.names[ev[eb].person];
     auto flush_user_day = [&]() {
         if (!haveUserDay || userDay.sessions == 0) return;
+        const auto outputStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         int best=-1; uint64_t bestRevenue=0;
         for (size_t k=0;k<lookups.categories.size();++k) {
             uint64_t v=userDay.byCategory[k];
@@ -644,6 +697,12 @@ static void process_person(
                 << userDay.revenue << ',';
         if (best>=0) userOut << lookups.categories[best];
         userOut << '\n';
+        ++profile.userRows;
+        if (profile.detailed) {
+            profile.userOutputNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - outputStart).count());
+        }
         userDay = UserDayAgg{};
         haveUserDay = false;
     };
@@ -660,6 +719,8 @@ static void process_person(
     int64_t previousTs=0;
 
     auto begin_session = [&](int64_t start) {
+        const auto sessionStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
         session = SessionState{};
         session.start = start;
         session.day = static_cast<uint32_t>((start-windowStart)/DAY_MS);
@@ -674,6 +735,9 @@ static void process_person(
         }
 
         int64_t cutoff = start - CLICK_WINDOW_MS;
+        const auto attributionStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
+        const auto clickAdvanceStart = attributionStart;
         // Expire clicks older than the inclusive seven-day boundary.
         while (activeBegin < nextClick && cl[activeBegin].ts < cutoff) {
             uint32_t campaign=cl[activeBegin].campaign;
@@ -686,6 +750,7 @@ static void process_person(
                 campaignPosition[campaign]=-1;
             }
             ++activeBegin;
+            ++profile.clickAdvances;
         }
         if (activeBegin == nextClick) {
             latestTs=std::numeric_limits<int64_t>::min();
@@ -716,6 +781,13 @@ static void process_person(
                 if (c.ts > latestTs) { latestTs=c.ts; latestCampaign=camp; }
             }
             ++nextClick;
+            ++profile.clickAdvances;
+        }
+        if (profile.detailed) {
+            const auto clickAdvanceEnd = std::chrono::steady_clock::now();
+            profile.clickAdvanceNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    clickAdvanceEnd - clickAdvanceStart).count());
         }
         uint32_t organic=static_cast<uint32_t>(lookups.campaignNames.size());
         session.credit = activeBegin < nextClick ? latestCampaign : organic;
@@ -723,11 +795,24 @@ static void process_person(
             size_t base=static_cast<size_t>(session.day)*(lookups.campaignNames.size()+1);
             for (uint32_t camp : activeCampaigns) campaignAgg[base+camp].assisted++;
         }
+        if (profile.detailed) {
+            profile.attributionNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - attributionStart).count());
+        }
         haveSession=true;
+        ++profile.sessions;
+        if (profile.detailed) {
+            profile.sessionBeginNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - sessionStart).count());
+        }
     };
 
     auto finish_session = [&]() {
         if (!haveSession) return;
+        const auto finishStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         ++userDay.sessions;
         size_t base=static_cast<size_t>(session.day)*(lookups.campaignNames.size()+1);
         CampaignAgg& c=campaignAgg[base+session.credit];
@@ -735,11 +820,29 @@ static void process_person(
         if (session.hasPurchase) ++c.purchasing;
         c.revenue += session.revenue;
         haveSession=false;
+        if (profile.detailed) {
+            profile.sessionFinishNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - finishStart).count());
+        }
     };
 
+    const auto eventLoopStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
     for (size_t i=eb;i<ee;++i) {
         const Event& e=ev[i];
-        if (!haveSession || e.ts-previousTs > SESSION_GAP_MS) {
+        bool newSession;
+        if (profile.detailed) {
+            const auto boundaryStart = std::chrono::steady_clock::now();
+            newSession = !haveSession || e.ts-previousTs > SESSION_GAP_MS;
+            profile.sessionBoundaryNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - boundaryStart).count());
+        } else {
+            newSession = !haveSession || e.ts-previousTs > SESSION_GAP_MS;
+        }
+        ++profile.boundaryChecks;
+        if (newSession) {
             finish_session();
             begin_session(e.ts);
         }
@@ -752,6 +855,11 @@ static void process_person(
         }
         previousTs=e.ts;
     }
+    if (profile.detailed) {
+        profile.eventLoopNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - eventLoopStart).count());
+    }
     finish_session();
     flush_user_day();
 }
@@ -760,8 +868,11 @@ static void process_bucket(
     int b, const std::vector<Event>& events, const std::vector<Click>& clicks,
     const UserPool& users, const Lookups& lookups, int64_t windowStart,
     uint32_t dayCount, const std::vector<std::string>& dayStrings,
-    std::vector<CampaignAgg>& campaignAgg, const fs::path& scratch
+    std::vector<CampaignAgg>& campaignAgg, const fs::path& scratch,
+    BucketProfile& profile
 ) {
+    const auto setupStart = profile.detailed ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     std::ofstream out(scratch/("user_"+std::to_string(b)+".csv"),std::ios::binary);
     if (!out) throw std::runtime_error("cannot create user aggregation temp file");
     out << "user_id,day,sessions,events,revenue_cents,top_category\n";
@@ -773,23 +884,61 @@ static void process_bucket(
     size_t ep=0, cp=0;
     const uint32_t campaignCount=static_cast<uint32_t>(lookups.campaignNames.size());
     campaignAgg.assign(static_cast<size_t>(dayCount)*(campaignCount+1),CampaignAgg{});
+    profile.events = events.size();
+    profile.clicks = clicks.size();
+    profile.eventBufferBytes = events.capacity() * sizeof(Event);
+    profile.clickBufferBytes = clicks.capacity() * sizeof(Click);
+    profile.workingStateBytes =
+        seen.capacity() * sizeof(uint32_t) +
+        count.capacity() * sizeof(uint32_t) +
+        position.capacity() * sizeof(int32_t) +
+        activeCampaigns.capacity() * sizeof(uint32_t) +
+        campaignAgg.capacity() * sizeof(CampaignAgg);
+    if (profile.detailed) {
+        profile.setupNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - setupStart).count());
+    }
 
     while (ep<events.size()) {
+        const auto indexStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
         uint32_t person=events[ep].person;
         size_t ee=ep+1;
         while (ee<events.size() && events[ee].person==person) ++ee;
         while (cp<clicks.size() && clicks[cp].person<person) ++cp;
         size_t ce=cp;
         while (ce<clicks.size() && clicks[ce].person==person) ++ce;
+        if (profile.detailed) {
+            profile.personIndexNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - indexStart).count());
+        }
+        ++profile.people;
         ++generation;
         if (generation==0) { std::fill(seen.begin(),seen.end(),0); generation=1; }
+        const auto personStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         process_person(events,ep,ee,clicks,cp,ce,users,lookups,windowStart,dayCount,
-                       campaignAgg,out,seen,count,position,activeCampaigns,generation,dayStrings);
+                       campaignAgg,out,seen,count,position,activeCampaigns,generation,dayStrings,
+                       profile);
+        if (profile.detailed) {
+            profile.processPersonNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - personStart).count());
+        }
         ep=ee;
         cp=ce;
     }
+    const auto finalizeStart = profile.detailed ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
     out.flush();
     if (!out) throw std::runtime_error("failed writing user aggregation temp file");
+    if (profile.detailed) {
+        profile.finalizeNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - finalizeStart).count());
+    }
 }
 
 // ---------------------------------- main ------------------------------------
@@ -799,7 +948,10 @@ int main() {
         const char* d = std::getenv("DATA_DIR");
         const char* o = std::getenv("OUTPUT_DIR");
         const char* s = std::getenv("SCRATCH_DIR");
+        const char* profileEnv = std::getenv("PIPELINE_PROFILE");
+        const bool detailedProfile = profileEnv && std::string_view(profileEnv) == "1";
         fs::path data=d?d:"/data", output=o?o:"/output", scratch=s? s:"/scratch";
+        logmsg(std::string("detailed profiling=") + (detailedProfile ? "enabled" : "disabled"));
         unsigned threads;
         int64_t windowStart, windowEnd;
         uint32_t dayCount;
@@ -972,6 +1124,7 @@ int main() {
         }
 
         std::vector<std::vector<CampaignAgg>> bucketAgg(BUCKETS);
+        std::array<BucketProfile,BUCKETS> bucketProfiles{};
         std::atomic<int> next{0};
         std::atomic<uint64_t> eventSortNs{0}, clickSortNs{0}, bucketProcessNs{0};
         std::mutex errorMutex;
@@ -982,15 +1135,18 @@ int main() {
                 if (b>=BUCKETS) break;
                 try {
                     auto& ev=eventBuckets[b]; auto& cl=clickBuckets[b];
+                    BucketProfile& profile=bucketProfiles[b];
+                    profile.detailed=detailedProfile;
                     auto eventSortStart=std::chrono::steady_clock::now();
                     std::sort(ev.begin(),ev.end(),[](const Event& a,const Event& b){
                         if(a.person!=b.person) return a.person<b.person;
                         return a.ts<b.ts;
                     });
                     auto eventSortEnd=std::chrono::steady_clock::now();
-                    eventSortNs.fetch_add(static_cast<uint64_t>(
+                    profile.eventSortNs=static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            eventSortEnd-eventSortStart).count()), std::memory_order_relaxed);
+                            eventSortEnd-eventSortStart).count());
+                    eventSortNs.fetch_add(profile.eventSortNs, std::memory_order_relaxed);
 
                     auto clickSortStart=std::chrono::steady_clock::now();
                     std::sort(cl.begin(),cl.end(),[](const Click& a,const Click& b){
@@ -999,16 +1155,19 @@ int main() {
                         return a.click_id<b.click_id;
                     });
                     auto clickSortEnd=std::chrono::steady_clock::now();
-                    clickSortNs.fetch_add(static_cast<uint64_t>(
+                    profile.clickSortNs=static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            clickSortEnd-clickSortStart).count()), std::memory_order_relaxed);
+                            clickSortEnd-clickSortStart).count());
+                    clickSortNs.fetch_add(profile.clickSortNs, std::memory_order_relaxed);
 
                     auto processStart=std::chrono::steady_clock::now();
-                    process_bucket(b,ev,cl,users,lookups,windowStart,dayCount,dayStrings,bucketAgg[b],scratch);
+                    process_bucket(b,ev,cl,users,lookups,windowStart,dayCount,dayStrings,
+                                   bucketAgg[b],scratch,profile);
                     auto processEnd=std::chrono::steady_clock::now();
-                    bucketProcessNs.fetch_add(static_cast<uint64_t>(
+                    profile.processNs=static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            processEnd-processStart).count()), std::memory_order_relaxed);
+                            processEnd-processStart).count());
+                    bucketProcessNs.fetch_add(profile.processNs, std::memory_order_relaxed);
                 } catch(const std::exception& e) {
                     std::lock_guard<std::mutex> lk(errorMutex);
                     if(workerError.empty()) workerError=e.what();
@@ -1022,6 +1181,7 @@ int main() {
             for(auto& t:pool) t.join();
             if(!workerError.empty()) throw std::runtime_error(workerError);
         }
+        for (int b=0;b<BUCKETS;++b) log_bucket_profile(b,bucketProfiles[b]);
         log_worker_timing("event_sort_worker_total", eventSortNs.load(std::memory_order_relaxed));
         log_worker_timing("click_sort_worker_total", clickSortNs.load(std::memory_order_relaxed));
         log_worker_timing("bucket_process_user_output_worker_total", bucketProcessNs.load(std::memory_order_relaxed));
