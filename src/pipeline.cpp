@@ -871,6 +871,8 @@ static void process_bucket(
     std::vector<CampaignAgg>& campaignAgg, const fs::path& scratch,
     BucketProfile& profile
 ) {
+    if (events.empty()) return;
+
     const auto setupStart = profile.detailed ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
     std::ofstream out(scratch/("user_"+std::to_string(b)+".csv"),std::ios::binary);
@@ -1137,6 +1139,13 @@ int main() {
                     auto& ev=eventBuckets[b]; auto& cl=clickBuckets[b];
                     BucketProfile& profile=bucketProfiles[b];
                     profile.detailed=detailedProfile;
+                    profile.events=ev.size();
+                    profile.clicks=cl.size();
+                    if (ev.empty()) {
+                        fs::remove(scratch/("user_"+std::to_string(b)+".csv"));
+                        continue;
+                    }
+
                     auto eventSortStart=std::chrono::steady_clock::now();
                     std::sort(ev.begin(),ev.end(),[](const Event& a,const Event& b){
                         if(a.person!=b.person) return a.person<b.person;
@@ -1180,6 +1189,13 @@ int main() {
             for(unsigned i=0;i<threads;++i) pool.emplace_back(worker);
             for(auto& t:pool) t.join();
             if(!workerError.empty()) throw std::runtime_error(workerError);
+        }
+        if (!fs::exists(scratch/"user_0.csv")) {
+            std::ofstream emptyUserOut(scratch/"user_0.csv",std::ios::binary);
+            if(!emptyUserOut) throw std::runtime_error("cannot create empty user aggregation file");
+            emptyUserOut << "user_id,day,sessions,events,revenue_cents,top_category\n";
+            emptyUserOut.flush();
+            if(!emptyUserOut) throw std::runtime_error("failed writing empty user aggregation file");
         }
         for (int b=0;b<BUCKETS;++b) log_bucket_profile(b,bucketProfiles[b]);
         log_worker_timing("event_sort_worker_total", eventSortNs.load(std::memory_order_relaxed));
