@@ -380,7 +380,7 @@ static int64_t parse_date10(const char* p) {
 // (valid or not) in a small direct-mapped table keyed by the ten date bytes.
 struct DateMemo { uint64_t k8 = 0; uint16_t k2 = 0; int64_t days = BAD_DATE; }; // k8 = 0 never matches real text
 static thread_local DateMemo dateMemo[128];
-static inline int64_t date_days(const char* p) {
+__attribute__((always_inline)) static inline int64_t date_days(const char* p) {
     uint64_t k8; uint16_t k2; std::memcpy(&k8, p, 8); std::memcpy(&k2, p + 8, 2);
     DateMemo& m = dateMemo[((k8 ^ (uint64_t(k2) << 40)) * 0x9E3779B97F4A7C15ULL) >> 57];
     if (m.k8 == k8 && m.k2 == k2) return m.days;
@@ -409,14 +409,76 @@ static bool parse_f1_or_f2(sv s, int64_t& out) {
     out = sec * 1000; // years are 4 digits, so no overflow is possible
     return true;
 }
-static inline bool parse_timestamp(sv s, int64_t& out) {
+static inline bool parse_timestamp_scalar(sv s, int64_t& out) {
     if (s.size() >= 19 && s[4] == '-' && s[7] == '-') return parse_f1_or_f2(s, out);
     uint64_t n;
     if (!parse_u64_ascii(s, n)) return false;
     if (n > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false; // outside any window
     out = static_cast<int64_t>(n); return true;
 }
+#ifdef __AVX2__
+// Same results as parse_f1_or_f2 / parse_timestamp_scalar, with the character checks done 16 bytes
+// at a time. Every load stays inside the field: [p, p+16) and [p+n-16, p+n) with n >= 20, and
+// for F3 only when the 16 bytes ending at the field's end lie in one page.
+static inline uint32_t digit_mask16(__m128i x) {
+    const __m128i d = _mm_sub_epi8(x, _mm_set1_epi8('0'));
+    return static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)));
+}
+__attribute__((always_inline)) static inline bool parse_f12_fast(const char* p, size_t n, int64_t& out) { // n is 20 or 25
+    alignas(16) static constexpr char H[16] = {0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0};
+    // tail = the last 16 bytes: positions 4..19 (F1) or 9..24 (F2)
+    alignas(16) static constexpr char TT[2][16] = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', 0, 0, 'Z'},
+                                                   {0, 0, 0, 0, 0, 0, 0, ':', 0, 0, 0, 0, 0, ':', 0, 0}};
+    static constexpr uint32_t HD = 0b1101101101101111, HL = 0b0010010010010000;
+    static constexpr uint32_t TD[2] = {0b0110000000000000, 0b1101101100000000};
+    static constexpr uint32_t TL[2] = {0b1001000000000000, 0b0010000010000000};
+    const int k = n == 25;
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + n - 16));
+    const uint32_t hd = digit_mask16(v), td = digit_mask16(t);
+    const uint32_t hl = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_load_si128(reinterpret_cast<const __m128i*>(H)))));
+    const uint32_t tl = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(t, _mm_load_si128(reinterpret_cast<const __m128i*>(TT[k])))));
+    bool ok = ((hd & HD) == HD) & ((hl & HL) == HL) & ((td & TD[k]) == TD[k]) & ((tl & TL[k]) == TL[k]);
+    if (k) ok &= (p[19] == '+') | (p[19] == '-');
+    if (!ok) return false;
+    const int hh = d2(p + 11), mm = d2(p + 14), ss = d2(p + 17);
+    int off = 0;
+    if (k) {
+        const int oh = d2(p + 20), om = d2(p + 23);
+        if (oh > 23 || om > 59) return false;
+        off = oh * 60 + om; if (p[19] == '-') off = -off;
+    }
+    if (hh > 23 || mm > 59 || ss > 59) return false;
+    const int64_t days = date_days(p);
+    if (days == BAD_DATE) return false;
+    out = (days * 86400 + hh * 3600 + mm * 60 + ss - int64_t(off) * 60) * 1000;
+    return true;
+}
+__attribute__((always_inline)) static inline bool parse_timestamp(sv s, int64_t& out) {
+    const char* p = s.data(); const size_t n = s.size();
+    if ((n == 20 || n == 25) && p[4] == '-') return parse_f12_fast(p, n, out);
+    // F3: a string with '-' anywhere is never all digits, so the scalar order of checks is irrelevant
+    if (n - 1 < 16 && (reinterpret_cast<uintptr_t>(p + n - 1) & 4095) >= 15) {
+        alignas(16) static constexpr uint8_t ZM[32] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                       255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + n - 16));
+        if ((digit_mask16(x) | ((1u << (16 - n)) - 1)) != 0xFFFF) return false;
+        __m128i d = _mm_and_si128(_mm_sub_epi8(x, _mm_set1_epi8('0')), _mm_loadu_si128(reinterpret_cast<const __m128i*>(ZM + n)));
+        d = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));     // 2 digits
+        d = _mm_madd_epi16(d, _mm_set1_epi32(0x00010064));    // 4 digits
+        d = _mm_packus_epi32(d, d);
+        d = _mm_madd_epi16(d, _mm_set1_epi32(0x00012710));    // 8 digits
+        const uint64_t hi = static_cast<uint32_t>(_mm_cvtsi128_si32(d)), lo = static_cast<uint32_t>(_mm_extract_epi32(d, 1));
+        out = static_cast<int64_t>(hi * 100000000ULL + lo);
+        return true;
+    }
+    return parse_timestamp_scalar(s, out);
+}
+static inline bool parse_f1(sv s, int64_t& out) { return s.size() == 20 && s[19] == 'Z' && s[4] == '-' && parse_f12_fast(s.data(), 20, out); }
+#else
+static inline bool parse_timestamp(sv s, int64_t& out) { return parse_timestamp_scalar(s, out); }
 static bool parse_f1(sv s, int64_t& out) { return s.size() == 20 && s.back() == 'Z' && parse_f1_or_f2(s, out); }
+#endif
 
 // ------------------------------- packed ID keys ------------------------------
 // An ID of 1..10 bytes from [0-9A-Z_a-z] is packed 6 bits a byte, first byte highest, padded with
@@ -787,6 +849,22 @@ static void sort_by_ts(E* a, size_t n, std::vector<E>& tmp) {
     }
 }
 
+// Stable LSD radix sort of n rows by their 31-bit ts field: three 11-bit digits, whose counts the
+// caller has already filled in hist[0..6143]. A digit shared by every row is skipped. Returns
+// whichever of a / b holds the sorted rows.
+template <class R>
+static R* radix_ts(R* a, R* b, size_t n, uint32_t* hist) {
+    if (n < 2) return a;
+    for (int d = 0; d < 3; ++d) {
+        uint32_t* h = hist + d * 2048; const int sh = 11 * d;
+        if (h[(a[0].ts >> sh) & 2047] == n) continue;
+        uint32_t sum = 0; for (int k = 0; k < 2048; ++k) { const uint32_t v = h[k]; h[k] = sum; sum += v; }
+        for (size_t i = 0; i < n; ++i) b[h[(a[i].ts >> sh) & 2047]++] = a[i];
+        std::swap(a, b);
+    }
+    return a;
+}
+
 // ---------------------------------- main -----------------------------------
 int main() {
     try {
@@ -1144,7 +1222,11 @@ int main() {
                 std::vector<uint32_t> evPid, clPid, evOff, clOff, fill;
                 struct EK { uint32_t ts, price_cat; };
                 struct CK { uint32_t ts, camp; uint64_t cid; };
-                std::vector<EK> ev, evTmp; std::vector<CK> cl;
+                std::vector<EK> ev; std::vector<CK> cl;
+                struct EP { uint32_t ts, pc, pid; };
+                struct CP { uint32_t ts, camp; uint64_t cid; uint32_t pid; };
+                std::vector<EP> epA, epB; std::vector<CP> cpA, cpB;
+                std::vector<uint32_t> hist(3 * 2048);
                 std::vector<uint32_t> count(C, 0), pos(C, 0), active;
                 std::vector<std::pair<uint8_t, uint64_t>> catSum;
                 for (uint32_t oi; (oi = np.fetch_add(1)) < NP;) {
@@ -1166,43 +1248,48 @@ int main() {
                             if (s.key == key) return s.pid;
                         }
                     };
-                    // counting sort events by person
-                    evPid.clear(); evPid.reserve(ne);
-                    for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { evPid.push_back(pid_of(e.person, true)); });
-                    const size_t P = persons.size();
-                    evOff.assign(P + 1, 0);
-                    for (uint32_t x : evPid) evOff[x + 1]++;
-                    for (size_t k = 0; k < P; ++k) evOff[k + 1] += evOff[k];
-                    ev.resize(ne);
-                    fill.assign(evOff.begin(), evOff.end() - 1);
-                    {
-                        size_t idx = 0;
-                        for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { ev[fill[evPid[idx++]]++] = EK{e.ts, e.price_cat}; });
-                    }
-                    // counting sort clicks by person (clicks of people without events are dropped)
-                    clPid.clear(); clPid.reserve(nc);
-                    for (unsigned w = 0; w < T; ++w) pcl[w][p].each([&](const PCl& c) { clPid.push_back(pid_of(c.person, false)); });
-                    clOff.assign(P + 1, 0);
-                    for (uint32_t x : clPid) if (x != 0xFFFFFFFFu) clOff[x + 1]++;
-                    for (size_t k = 0; k < P; ++k) clOff[k + 1] += clOff[k];
-                    cl.resize(clOff[P]);
-                    fill.assign(clOff.begin(), clOff.end() - 1);
+                    // Events, then clicks: gathered with their local person id, stably radix-sorted by
+                    // ts (three 11-bit digits; ts < 2^31), then stably scattered by person, so each
+                    // person's rows come out in ts order without a per-person sort.
+                    epA.resize(ne); epB.resize(ne);
+                    std::fill(hist.begin(), hist.end(), 0);
                     {
                         size_t idx = 0;
                         for (unsigned w = 0; w < T; ++w)
-                            pcl[w][p].each([&](const PCl& c) {
-                                uint32_t x = clPid[idx++];
-                                if (x != 0xFFFFFFFFu) cl[fill[x]++] = CK{c.ts, c.camp, c.cid};
+                            pev[w][p].each([&](const PEv& e) {
+                                epA[idx++] = EP{e.ts, e.price_cat, pid_of(e.person, true)};
+                                hist[e.ts & 2047]++; hist[2048 + ((e.ts >> 11) & 2047)]++; hist[4096 + (e.ts >> 22)]++;
                             });
                     }
+                    const EP* es = radix_ts(epA.data(), epB.data(), ne, hist.data());
+                    const size_t P = persons.size();
+                    evOff.assign(P + 1, 0);
+                    for (size_t i = 0; i < ne; ++i) evOff[es[i].pid + 1]++;
+                    for (size_t k = 0; k < P; ++k) evOff[k + 1] += evOff[k];
+                    ev.resize(ne);
+                    fill.assign(evOff.begin(), evOff.end() - 1);
+                    for (size_t i = 0; i < ne; ++i) ev[fill[es[i].pid]++] = EK{es[i].ts, es[i].pc};
+                    // clicks of people without events are dropped
+                    cpA.resize(nc); cpB.resize(nc);
+                    std::fill(hist.begin(), hist.end(), 0);
+                    size_t ncl = 0;
+                    for (unsigned w = 0; w < T; ++w)
+                        pcl[w][p].each([&](const PCl& c) {
+                            const uint32_t x = pid_of(c.person, false);
+                            if (x == 0xFFFFFFFFu) return;
+                            cpA[ncl++] = CP{c.ts, c.camp, c.cid, x};
+                            hist[c.ts & 2047]++; hist[2048 + ((c.ts >> 11) & 2047)]++; hist[4096 + (c.ts >> 22)]++;
+                        });
+                    const CP* cs = radix_ts(cpA.data(), cpB.data(), ncl, hist.data());
+                    clOff.assign(P + 1, 0);
+                    for (size_t i = 0; i < ncl; ++i) clOff[cs[i].pid + 1]++;
+                    for (size_t k = 0; k < P; ++k) clOff[k + 1] += clOff[k];
+                    cl.resize(ncl);
+                    fill.assign(clOff.begin(), clOff.end() - 1);
+                    for (size_t i = 0; i < ncl; ++i) cl[fill[cs[i].pid]++] = CK{cs[i].ts, cs[i].camp, cs[i].cid};
                     for (size_t pid = 0; pid < P; ++pid) {
                         const size_t eb = evOff[pid], ee = evOff[pid + 1];
                         const size_t cb = clOff[pid], ce = clOff[pid + 1];
-                        if (ee - eb > 1) sort_by_ts(ev.data() + eb, ee - eb, evTmp);
-                        if (ce - cb > 1) std::sort(cl.begin() + cb, cl.begin() + ce, [](const CK& a, const CK& b) {
-                            if (a.ts != b.ts) return a.ts < b.ts;
-                            return key_less(a.cid, b.cid);
-                        });
                         const std::string name = key_str(persons[pid]);
 
                         size_t lo = cb, hi = cb, runStart = cb;
@@ -1232,7 +1319,7 @@ int main() {
                             while (hi < ce && cl[hi].ts <= S) {
                                 uint32_t cp = cl[hi].camp;
                                 if (count[cp]++ == 0) { pos[cp] = static_cast<uint32_t>(active.size()); active.push_back(cp); }
-                                if (hi == cb || cl[hi].ts != cl[hi - 1].ts) runStart = hi; // first (smallest id) of the latest ts
+                                if (hi == cb || cl[hi].ts != cl[hi - 1].ts) runStart = hi; // first click of the latest ts
                                 ++hi;
                             }
                             while (lo < hi && static_cast<int64_t>(cl[lo].ts) < cutoff) {
@@ -1240,7 +1327,14 @@ int main() {
                                 if (--count[cp] == 0) { uint32_t mv = active.back(); active[pos[cp]] = mv; pos[mv] = pos[cp]; active.pop_back(); }
                                 ++lo;
                             }
-                            const uint32_t credit = lo < hi ? cl[runStart].camp : ORGANIC;
+                            // latest ts in the window; among clicks at that ts the smallest click_id
+                            // ([runStart, hi) is that run, all inside the window since lo < hi)
+                            uint32_t credit = ORGANIC;
+                            if (lo < hi) {
+                                size_t bi = runStart;
+                                for (size_t k = runStart + 1; k < hi; ++k) if (key_less(cl[k].cid, cl[bi].cid)) bi = k;
+                                credit = cl[bi].camp;
+                            }
                             CampAgg* dayAgg = &agg[static_cast<size_t>(day) * stride];
                             if (credit != ORGANIC) for (uint32_t cp : active) dayAgg[cp].assisted++;
                             uint64_t sRevenue = 0, sEvents = 0; bool sPurchase = false;
