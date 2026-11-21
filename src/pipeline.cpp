@@ -409,14 +409,76 @@ static bool parse_f1_or_f2(sv s, int64_t& out) {
     out = sec * 1000; // years are 4 digits, so no overflow is possible
     return true;
 }
-static inline bool parse_timestamp(sv s, int64_t& out) {
+static inline bool parse_timestamp_scalar(sv s, int64_t& out) {
     if (s.size() >= 19 && s[4] == '-' && s[7] == '-') return parse_f1_or_f2(s, out);
     uint64_t n;
     if (!parse_u64_ascii(s, n)) return false;
     if (n > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false; // outside any window
     out = static_cast<int64_t>(n); return true;
 }
+#ifdef __AVX2__
+// Same results as parse_f1_or_f2 / parse_timestamp_scalar, with the character checks done 16 bytes
+// at a time. Every load stays inside the field: [p, p+16) and [p+n-16, p+n) with n >= 20, and
+// for F3 only when the 16 bytes ending at the field's end lie in one page.
+static inline uint32_t digit_mask16(__m128i x) {
+    const __m128i d = _mm_sub_epi8(x, _mm_set1_epi8('0'));
+    return static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)));
+}
+static inline bool parse_f12_fast(const char* p, size_t n, int64_t& out) { // n is 20 or 25
+    alignas(16) static constexpr char H[16] = {0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0};
+    // tail = the last 16 bytes: positions 4..19 (F1) or 9..24 (F2)
+    alignas(16) static constexpr char TT[2][16] = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', 0, 0, 'Z'},
+                                                   {0, 0, 0, 0, 0, 0, 0, ':', 0, 0, 0, 0, 0, ':', 0, 0}};
+    static constexpr uint32_t HD = 0b1101101101101111, HL = 0b0010010010010000;
+    static constexpr uint32_t TD[2] = {0b0110000000000000, 0b1101101100000000};
+    static constexpr uint32_t TL[2] = {0b1001000000000000, 0b0010000010000000};
+    const int k = n == 25;
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + n - 16));
+    const uint32_t hd = digit_mask16(v), td = digit_mask16(t);
+    const uint32_t hl = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_load_si128(reinterpret_cast<const __m128i*>(H)))));
+    const uint32_t tl = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(t, _mm_load_si128(reinterpret_cast<const __m128i*>(TT[k])))));
+    bool ok = ((hd & HD) == HD) & ((hl & HL) == HL) & ((td & TD[k]) == TD[k]) & ((tl & TL[k]) == TL[k]);
+    if (k) ok &= (p[19] == '+') | (p[19] == '-');
+    if (!ok) return false;
+    const int hh = d2(p + 11), mm = d2(p + 14), ss = d2(p + 17);
+    int off = 0;
+    if (k) {
+        const int oh = d2(p + 20), om = d2(p + 23);
+        if (oh > 23 || om > 59) return false;
+        off = oh * 60 + om; if (p[19] == '-') off = -off;
+    }
+    if (hh > 23 || mm > 59 || ss > 59) return false;
+    const int64_t days = date_days(p);
+    if (days == BAD_DATE) return false;
+    out = (days * 86400 + hh * 3600 + mm * 60 + ss - int64_t(off) * 60) * 1000;
+    return true;
+}
+static inline bool parse_timestamp(sv s, int64_t& out) {
+    const char* p = s.data(); const size_t n = s.size();
+    if ((n == 20 || n == 25) && p[4] == '-') return parse_f12_fast(p, n, out);
+    // F3: a string with '-' anywhere is never all digits, so the scalar order of checks is irrelevant
+    if (n - 1 < 16 && (reinterpret_cast<uintptr_t>(p + n - 1) & 4095) >= 15) {
+        alignas(16) static constexpr uint8_t ZM[32] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                       255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + n - 16));
+        if ((digit_mask16(x) | ((1u << (16 - n)) - 1)) != 0xFFFF) return false;
+        __m128i d = _mm_and_si128(_mm_sub_epi8(x, _mm_set1_epi8('0')), _mm_loadu_si128(reinterpret_cast<const __m128i*>(ZM + n)));
+        d = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));     // 2 digits
+        d = _mm_madd_epi16(d, _mm_set1_epi32(0x00010064));    // 4 digits
+        d = _mm_packus_epi32(d, d);
+        d = _mm_madd_epi16(d, _mm_set1_epi32(0x00012710));    // 8 digits
+        const uint64_t hi = static_cast<uint32_t>(_mm_cvtsi128_si32(d)), lo = static_cast<uint32_t>(_mm_extract_epi32(d, 1));
+        out = static_cast<int64_t>(hi * 100000000ULL + lo);
+        return true;
+    }
+    return parse_timestamp_scalar(s, out);
+}
+static inline bool parse_f1(sv s, int64_t& out) { return s.size() == 20 && s[19] == 'Z' && s[4] == '-' && parse_f12_fast(s.data(), 20, out); }
+#else
+static inline bool parse_timestamp(sv s, int64_t& out) { return parse_timestamp_scalar(s, out); }
 static bool parse_f1(sv s, int64_t& out) { return s.size() == 20 && s.back() == 'Z' && parse_f1_or_f2(s, out); }
+#endif
 
 // ------------------------------- packed ID keys ------------------------------
 // An ID of 1..10 bytes from [0-9A-Z_a-z] is packed 6 bits a byte, first byte highest, padded with
