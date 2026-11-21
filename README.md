@@ -89,5 +89,9 @@ Per-phase timings go to stderr (`timing phase=... elapsed_ms=...`).
   exactly 30:00.000 and 30:00.001, click boundaries at exactly 7 days, at the session start and
   1 ms off, same-ms ties, link chains and self-links, and assist-only campaigns.
   Set `CHUNK=1` to split every line into its own work chunk.
+* Independent reference: `tools/reference.py DATA OUT` is a slow, plain-Python implementation
+  written straight from `rules.md` (no code shared with the C++). It agrees with the native binary
+  on 1,000 fuzz seeds and on a 1M-event synthetic set:
+  `python3 tools/reference.py DATA ref/ && python3 scripts/compare.py ref/ out/`.
 * Large synthetic data: `g++ -O2 -std=c++20 tools/gen_dirty.cpp -o gen && ./gen SEED EVENTS CLICKS OUTDIR`
   (follows the generator description and dirt rates in `rules.md`).
