@@ -72,7 +72,13 @@ static std::string bad_ts(i64 ms, i64 ws, i64 we) {
     }
 }
 static std::string quote(const std::string& s) { return P(0.2) ? "\"" + s + "\"" : s; }
-static std::string idstr(char p, u64 x) { char b[32]; snprintf(b, sizeof b, "%c%010llx", p, (unsigned long long)x); return b; }
+// Same shape as the official generator: a letter, then base 36 of a 40-bit scrambled number.
+static std::string idstr(char p, u64 x) {
+    static const char* D = "0123456789abcdefghijklmnopqrstuvwxyz";
+    x &= (u64(1) << 40) - 1; char b[16]; int at = 16;
+    do { b[--at] = D[x % 36]; x /= 36; } while (x);
+    return std::string(1, p) + std::string(b + at, 16 - at);
+}
 static std::string upper(std::string s) { for (auto& c : s) c = (char)toupper((unsigned char)c); return s; }
 
 struct Files {

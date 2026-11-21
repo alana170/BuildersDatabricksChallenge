@@ -26,7 +26,10 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -266,82 +269,121 @@ static inline bool parse_timestamp(sv s, int64_t& out) {
 }
 static bool parse_f1(sv s, int64_t& out) { return s.size() == 20 && s.back() == 'Z' && parse_f1_or_f2(s, out); }
 
-// ------------------------------- names & maps -------------------------------
-// A Name carries its bytes inline when they fit in 16 bytes (every ID in the generated
-// data does), so equality tests and output never go back to the mapped CSV bytes.
-// Comparisons are always exact: hash, then length, then bytes.
-struct Name {
-    uint64_t h; uint32_t len; uint32_t aux;
-    union { char inl[16]; const char* ptr; } u;
-    inline const char* data() const { return len <= 16 ? u.inl : u.ptr; }
-    inline sv view() const { return sv(data(), len); }
-    inline bool eq(const Name& o) const { return h == o.h && len == o.len && std::memcmp(data(), o.data(), len) == 0; }
-    inline bool eq(sv s, uint64_t hh) const { return h == hh && len == s.size() && std::memcmp(data(), s.data(), len) == 0; }
-    static inline Name make(sv s, uint64_t hh) {
-        Name n; n.h = hh; n.len = static_cast<uint32_t>(s.size()); n.aux = 0;
-        if (n.len <= 16) { std::memset(n.u.inl, 0, 16); std::memcpy(n.u.inl, s.data(), n.len); } else n.u.ptr = s.data();
-        return n;
+// ------------------------------- packed ID keys ------------------------------
+// An ID of 1..10 bytes from [0-9A-Z_a-z] is packed 6 bits a byte, first byte highest, padded with
+// zero codes. Codes follow ASCII order, so integer order is byte-wise order and integer equality
+// is byte equality. Every ID in the generator's data has this shape (a letter and up to 8 base-36
+// characters). Any other non-empty ID is interned and gets INTERNED | index; comparisons that
+// involve one fall back to its bytes, so the result is exact for every input.
+static constexpr uint64_t INTERNED = 1ULL << 63;
+static constexpr uint64_t NO_KEY = ~0ULL;          // "no person": an invalid kept copy
+static uint8_t PACK[256];
+static char UNPACK[64];
+static void init_pack() {
+    int c = 1;
+    auto add = [&](char lo, char hi) { for (char ch = lo; ch <= hi; ++ch) { PACK[static_cast<uint8_t>(ch)] = static_cast<uint8_t>(c); UNPACK[c] = ch; ++c; } };
+    add('0', '9'); add('A', 'Z'); add('_', '_'); add('a', 'z'); // ASCII order: 0-9 < A-Z < _ < a-z
+}
+// Sharded so that even input made only of such IDs stays parallel.
+struct Interner {
+    static constexpr uint32_t SHARDS = 256, SHIFT = 54; // index = shard << SHIFT | local
+    struct Shard { std::mutex m; std::unordered_map<std::string, uint32_t> ids; std::deque<std::string> names; };
+    Shard shards[SHARDS];
+    uint64_t get(sv s) {
+        uint32_t sh = static_cast<uint32_t>(hash_sv(s) >> 56);
+        Shard& S = shards[sh];
+        std::lock_guard<std::mutex> g(S.m);
+        auto it = S.ids.find(std::string(s));
+        uint32_t i;
+        if (it != S.ids.end()) i = it->second;
+        else { i = static_cast<uint32_t>(S.names.size()); S.names.emplace_back(s); S.ids.emplace(S.names.back(), i); }
+        return (uint64_t(sh) << SHIFT) | i;
+    }
+    std::string name(uint64_t idx) {
+        Shard& S = shards[idx >> SHIFT];
+        std::lock_guard<std::mutex> g(S.m);
+        return S.names[static_cast<uint32_t>(idx & ((uint64_t(1) << SHIFT) - 1))];
     }
 };
-static_assert(sizeof(Name) == 32);
-static constexpr uint32_t EMPTY_LEN = 0xFFFFFFFFu;
+static Interner interner;
+static inline bool pack_key(sv s, uint64_t& k) {
+    size_t n = s.size();
+    if (n == 0 || n > 10) return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t c = PACK[static_cast<uint8_t>(s[i])];
+        if (!c) return false;
+        v = (v << 6) | c;
+    }
+    k = v << (6 * (10 - n));
+    return true;
+}
+static inline uint64_t key_of(sv s) { // s must be non-empty
+    uint64_t k;
+    if (pack_key(s, k)) return k;
+    return INTERNED | interner.get(s);
+}
+static std::string key_str(uint64_t k) {
+    if (k & INTERNED) return interner.name(k & ~INTERNED);
+    std::string s;
+    for (int i = 9; i >= 0; --i) {
+        uint32_t c = static_cast<uint32_t>((k >> (6 * i)) & 63);
+        if (!c) break;
+        s.push_back(UNPACK[c]);
+    }
+    return s;
+}
+static inline bool key_less(uint64_t a, uint64_t b) {
+    if (!((a | b) & INTERNED)) return a < b;
+    return key_str(a) < key_str(b); // std::string compares bytes as unsigned
+}
+static inline uint64_t khash(uint64_t k) { return mix(k ^ 0x9E3779B97F4A7C15ULL, 0xD6E8FEB86659FD93ULL); }
 
-struct StrMap { // read-only after build; value kept in key.aux
-    std::vector<Name> tab; uint64_t mask = 0;
-    void build(size_t expected) {
-        size_t cap = 16; while (cap < expected * 2 + 16) cap <<= 1;
-        Name e{}; e.len = EMPTY_LEN; tab.assign(cap, e); mask = cap - 1;
-    }
-    bool insert(sv k, uint32_t v) { // keeps the first value for a key
-        uint64_t h = hash_sv(k);
-        for (uint64_t p = h & mask;; p = (p + 1) & mask) {
-            Name& e = tab[p];
-            if (e.len == EMPTY_LEN) { e = Name::make(k, h); e.aux = v; return true; }
-            if (e.eq(k, h)) return false;
-        }
-    }
-    inline void prefetch(uint64_t h) const { __builtin_prefetch(&tab[h & mask]); }
-    inline int64_t find(sv k, uint64_t h) const {
-        for (uint64_t p = h & mask;; p = (p + 1) & mask) {
-            const Name& e = tab[p];
-            if (e.len == EMPTY_LEN) return -1;
-            if (e.eq(k, h)) return e.aux;
-        }
-    }
-    inline int64_t find(sv k) const { return find(k, hash_sv(k)); }
-};
-
-// Linked-ID table: one 64-byte line per ID holding the ID and its person's name.
-struct alignas(64) IdEntry { Name key; Name canon; };
-struct IdTable {
-    // Capacity is not a power of two: slot = (low 32 hash bits * cap) >> 32, so the table
-    // can be sized to ~60% load from the distinct-ID count.
-    struct Part { std::vector<IdEntry> tab; uint64_t cap = 0; uint32_t base = 0, count = 0; };
-    std::vector<Part> parts = std::vector<Part>(NID);
-    static inline uint32_t part_of(uint64_t h) { return static_cast<uint32_t>(h >> (64 - ID_BITS)); }
-    static inline uint64_t slot_of(uint64_t h, uint64_t cap) { return ((h & 0xFFFFFFFFu) * cap) >> 32; }
-    inline void prefetch(uint64_t h) const {
-        const Part& P = parts[part_of(h)];
-        if (P.cap) __builtin_prefetch(&P.tab[slot_of(h, P.cap)]);
-    }
-    inline const IdEntry* find(sv s, uint64_t h) const {
-        const Part& P = parts[part_of(h)];
-        if (!P.cap) return nullptr;
-        for (uint64_t p = slot_of(h, P.cap);;) {
-            const IdEntry& e = P.tab[p];
-            if (e.key.len == EMPTY_LEN) return nullptr;
-            if (e.key.eq(s, h)) return &e;
-            if (++p == P.cap) p = 0;
-        }
-    }
-    // Insert-or-find during the build; returns the entry and whether it was new.
-    static IdEntry* upsert(std::vector<IdEntry>& tab, uint64_t cap, const Name& k, bool& fresh) {
-        for (uint64_t p = slot_of(k.h, cap);;) {
-            IdEntry& e = tab[p];
-            if (e.key.len == EMPTY_LEN) { e.key = k; fresh = true; return &e; }
-            if (e.key.eq(k)) { fresh = false; return &e; }
+// u64 key -> u64 value, open addressing, capacity sized to ~60% load (not a power of two).
+struct KeyMap {
+    struct E { uint64_t k, v; };
+    static constexpr uint64_t EMPTY = ~0ULL - 1; // never a real key (interned indexes stay small)
+    std::vector<E> t; uint64_t cap = 0;
+    void build(size_t n) { cap = n + n * 2 / 3 + 16; t.assign(cap, E{EMPTY, 0}); }
+    static inline uint64_t slot(uint64_t h, uint64_t cap) { return ((h & 0xFFFFFFFFu) * cap) >> 32; }
+    inline void prefetch(uint64_t h) const { if (cap) __builtin_prefetch(&t[slot(h, cap)]); }
+    // returns the entry; fresh = inserted now
+    E* upsert(uint64_t k, uint64_t h, bool& fresh) {
+        for (uint64_t p = slot(h, cap);;) {
+            E& e = t[p];
+            if (e.k == EMPTY) { e.k = k; fresh = true; return &e; }
+            if (e.k == k) { fresh = false; return &e; }
             if (++p == cap) p = 0;
         }
+    }
+    inline const E* find(uint64_t k, uint64_t h) const {
+        if (!cap) return nullptr;
+        for (uint64_t p = slot(h, cap);;) {
+            const E& e = t[p];
+            if (e.k == k) return &e;
+            if (e.k == EMPTY) return nullptr;
+            if (++p == cap) p = 0;
+        }
+    }
+};
+
+// Lookup tables keyed by ID text (products, campaigns). Packable IDs go through a KeyMap;
+// any other spelling through an exact string map (never hit by the generator's data).
+struct IdLookup {
+    KeyMap packed; std::unordered_map<std::string, uint32_t> other;
+    void build(size_t n) { packed.build(n); }
+    bool insert(sv s, uint32_t v) { // keeps the first value for an ID
+        uint64_t k;
+        if (pack_key(s, k)) { bool fresh; KeyMap::E* e = packed.upsert(k, khash(k), fresh); if (fresh) e->v = v; return fresh; }
+        return other.emplace(std::string(s), v).second;
+    }
+    inline void prefetch(sv s) const { uint64_t k; if (pack_key(s, k)) packed.prefetch(khash(k)); }
+    inline int64_t find(sv s) const {
+        uint64_t k;
+        if (pack_key(s, k)) { const KeyMap::E* e = packed.find(k, khash(k)); return e ? static_cast<int64_t>(e->v) : -1; }
+        if (other.empty()) return -1;
+        auto it = other.find(std::string(s));
+        return it == other.end() ? -1 : static_cast<int64_t>(it->second);
     }
 };
 
@@ -508,31 +550,73 @@ struct BlockList {
         *dst = v;
 #endif
     }
+    // Append n records; a whole number of cache lines at an aligned spot leaves through
+    // non-temporal stores.
+    inline void push_group(const T* src, uint32_t n, SlabAlloc& al) {
+        if (!tail || tail->n + n > B) {
+            Blk* b = static_cast<Blk*>(al.get(sizeof(Blk))); b->next = nullptr; b->n = 0;
+            if (tail) tail->next = b; else head = b;
+            tail = b;
+        }
+        T* dst = &tail->items[tail->n];
+        const size_t bytes = size_t(n) * sizeof(T);
+#ifdef __AVX2__
+        if (bytes % 64 == 0 && (reinterpret_cast<uintptr_t>(dst) & 63) == 0) {
+            const __m256i* s = reinterpret_cast<const __m256i*>(src);
+            __m256i* q = reinterpret_cast<__m256i*>(dst);
+            for (size_t k = 0; k < bytes / 32; ++k) _mm256_stream_si256(q + k, _mm256_loadu_si256(s + k));
+        } else
+#endif
+            std::memcpy(dst, src, bytes);
+        tail->n += n; total += n;
+    }
     template <class F> inline void each(F&& f) const { for (Blk* b = head; b; b = b->next) for (uint32_t i = 0; i < b->n; ++i) f(b->items[i]); }
     size_t size() const { return total; }
 };
 
-// ------------------------------- record types ------------------------------
-struct alignas(64) ERec {   // one parsed event line (partition #1); person resolved for valid rows
-    Name name;              // name.aux = ts relative to the click-window start
-    const char* eid; int64_t ingest;
-    uint32_t eidLen, eidHash, price; uint8_t type, cat, valid, pad;
-};
-struct PEv {                // one surviving event (partition #2)
-    Name name;              // name.aux = ts
-    uint32_t price; uint8_t type, cat; uint16_t pad;
-};
-struct PCl {                // one valid click (partition #2)
-    Name name;              // name.aux = ts
-    const char* cid; uint32_t cidLen, camp;
-};
 template <class T> using Grid = std::vector<std::vector<std::vector<T>>>; // [worker][partition]
 template <class T, uint32_t B> using BGrid = std::vector<std::vector<BlockList<T, B>>>;
-static inline uint32_t ppart(uint64_t nh) { return static_cast<uint32_t>((nh >> 20) & (NP - 1)); }
+
+// ------------------------------- record types ------------------------------
+// price_cat: purchase price (1..10,000,000 < 2^24) in the low 24 bits, category in the top 8.
+// A non-purchase has price_cat == 0: only purchases ever need a category.
+struct ERec { uint64_t eid, person; int64_t ingest; uint32_t ts, price_cat; };   // 32 bytes
+struct PEv { uint64_t person; uint32_t ts, price_cat; };                          // 16 bytes
+struct PCl { uint64_t person, cid; uint32_t ts, camp; };                          // 24 bytes
+static_assert(sizeof(ERec) == 32 && sizeof(PEv) == 16 && sizeof(PCl) == 24);
+static inline uint32_t part_of(uint64_t h, int bits) { return static_cast<uint32_t>(h >> (64 - bits)); }
+
+// Write-combining scatter: records for each partition are staged in a cache-line-aligned
+// buffer of K records and leave it with non-temporal stores, so no destination line is ever
+// read just to be overwritten.
+template <class T, uint32_t K, uint32_t B>
+struct Scatter {
+    static_assert((sizeof(T) * K) % 64 == 0 && B % K == 0);
+    std::vector<BlockList<T, B>>* lists = nullptr;
+    T* stage = nullptr; std::vector<uint8_t> fill; SlabAlloc al;
+    void init(std::vector<BlockList<T, B>>* l, Arena* a) {
+        lists = l; al.a = a; fill.assign(l->size(), 0);
+        stage = static_cast<T*>(std::aligned_alloc(64, l->size() * K * sizeof(T)));
+    }
+    inline void push(uint32_t p, const T& v) {
+        T* s = stage + static_cast<size_t>(p) * K;
+        s[fill[p]++] = v;
+        if (fill[p] == K) { (*lists)[p].push_group(s, K, al); fill[p] = 0; }
+    }
+    void finish() {
+        for (size_t p = 0; p < fill.size(); ++p)
+            if (fill[p]) { (*lists)[p].push_group(stage + p * K, fill[p], al); fill[p] = 0; }
+#ifdef __AVX2__
+        _mm_sfence();
+#endif
+        std::free(stage); stage = nullptr;
+    }
+};
 
 // ---------------------------------- main -----------------------------------
 int main() {
     try {
+        init_pack();
         const char* d = std::getenv("DATA_DIR"); const char* o = std::getenv("OUTPUT_DIR");
         fs::path data = d ? d : "/data", output = o ? o : "/output";
         unsigned T = 8;
@@ -555,34 +639,35 @@ int main() {
             if (!parse_f1(a, ws) || !parse_f1(b, we) || we <= ws) throw std::runtime_error("invalid manifest window");
         }
         const int64_t cws = ws - CLICK_WINDOW_MS;              // all times are stored relative to this
-        if (cws < 0 || we - cws >= (int64_t(1) << 32)) throw std::runtime_error("unsupported window");
+        if (cws < 0 || we - cws >= (int64_t(1) << 31)) throw std::runtime_error("unsupported window");
         const int64_t firstDay = ws / DAY_MS;
         const uint32_t dayCount = static_cast<uint32_t>((we - 1) / DAY_MS - firstDay + 1);
         fs::create_directories(output / "user_daily");
         fs::create_directories(output / "campaign_daily");
 
         // ---- lookups ----
-        StrMap products, campaigns;
-        std::vector<sv> catNames, campNames, channels;
+        IdLookup products, campaigns;
+        std::vector<std::string> catNames;
+        std::vector<std::string> campNames, channels;
         std::vector<uint32_t> catRank;
-        const uint32_t unknownCat = 0;
         {
             Phase ph("lookups");
             catNames.push_back("unknown");
-            StrMap catMap; catMap.build(64); catMap.insert("unknown", 0);
+            std::unordered_map<std::string, uint32_t> catMap{{"unknown", 0}};
             Mapping pm = map_file(data / "products.csv");
             std::vector<std::pair<sv, sv>> rows;
             for (sv c : make_chunks({pm}, size_t(1) << 40))
                 scan_lines<2>(c, [&](const std::array<sv, 2>& f) { if (!f[0].empty()) rows.emplace_back(f[0], f[1]); });
             products.build(rows.size());
             for (auto& [pid, cat] : rows) {
-                int64_t ci = catMap.find(cat);
-                if (ci < 0) {
-                    ci = static_cast<int64_t>(catNames.size());
+                auto it = catMap.find(std::string(cat));
+                uint32_t ci;
+                if (it == catMap.end()) {
+                    ci = static_cast<uint32_t>(catNames.size());
                     if (ci > 255) throw std::runtime_error("too many categories");
-                    catNames.push_back(cat); catMap.insert(cat, static_cast<uint32_t>(ci));
-                }
-                products.insert(pid, static_cast<uint32_t>(ci));
+                    catNames.emplace_back(cat); catMap.emplace(std::string(cat), ci);
+                } else ci = it->second;
+                products.insert(pid, ci);
             }
             std::vector<uint32_t> order(catNames.size());
             for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -596,77 +681,71 @@ int main() {
                 scan_lines<2>(c, [&](const std::array<sv, 2>& f) { if (!f[0].empty()) crow.emplace_back(f[0], f[1]); });
             campaigns.build(crow.size());
             for (auto& [cid, ch] : crow)
-                if (campaigns.insert(cid, static_cast<uint32_t>(campNames.size()))) { campNames.push_back(cid); channels.push_back(ch); }
+                if (campaigns.insert(cid, static_cast<uint32_t>(campNames.size()))) { campNames.emplace_back(cid); channels.emplace_back(ch); }
         }
         const uint32_t C = static_cast<uint32_t>(campNames.size());
         const uint32_t ORGANIC = C;
 
-        // ---- links: ID table + union-find ----
-        IdTable idt;
+        // ---- links: ID table (key -> person key) via lock-free union-find ----
+        std::vector<KeyMap> idParts(NID);
+        auto resolve_h = [&](uint64_t k, uint64_t h) -> uint64_t {
+            const KeyMap::E* e = idParts[part_of(h, ID_BITS)].find(k, h);
+            return e ? e->v : k;
+        };
+        auto id_prefetch = [&](uint64_t h) { idParts[part_of(h, ID_BITS)].prefetch(h); };
         {
             Phase ph("links");
             auto maps = map_csv_dir(data / "links");
             auto chunks = make_chunks(maps, chunk_bytes(1u << 20));
-            struct Side { sv s; uint64_t h; };
-            std::vector<std::vector<std::pair<Side, Side>>> pairs(T);
-            Grid<Side> ids(T, std::vector<std::vector<Side>>(NID));
+            std::vector<std::vector<std::pair<uint64_t, uint64_t>>> pairs(T);
+            Grid<uint64_t> ids(T, std::vector<std::vector<uint64_t>>(NID));
             std::atomic<size_t> next{0};
-            auto lt0 = std::chrono::steady_clock::now();
-            auto lap = [&](const char* what) {
-                auto now = std::chrono::steady_clock::now();
-                fprintf(stderr, "  links.%s %.1f ms\n", what, std::chrono::duration<double, std::milli>(now - lt0).count()); lt0 = now;
-            };
             run_threads(T, [&](unsigned t) {
                 for (size_t i; (i = next.fetch_add(1)) < chunks.size();)
                     scan_lines<2>(chunks[i], [&](const std::array<sv, 2>& f) {
                         if (f[0].empty() || f[1].empty()) return;
-                        Side a{f[0], hash_sv(f[0])}, b{f[1], hash_sv(f[1])};
+                        uint64_t a = key_of(f[0]), b = key_of(f[1]);
                         pairs[t].emplace_back(a, b);
-                        ids[t][IdTable::part_of(a.h)].push_back(a);
-                        if (b.h != a.h || b.s != a.s) ids[t][IdTable::part_of(b.h)].push_back(b);
+                        ids[t][part_of(khash(a), ID_BITS)].push_back(a);
+                        if (b != a) ids[t][part_of(khash(b), ID_BITS)].push_back(b);
                     });
             });
-            lap("parse");
-            // Build each ID partition independently; local index -> global id.
-            std::vector<std::vector<IdEntry*>> byLocal(NID);
+            // distinct IDs per partition -> local index; global index = base + local
+            std::vector<uint32_t> base(NID + 1, 0), count(NID, 0);
+            std::vector<std::vector<uint64_t>> localKeys(NID);
             std::atomic<uint32_t> np{0};
             run_threads(T, [&](unsigned) {
                 for (uint32_t p; (p = np.fetch_add(1)) < NID;) {
                     size_t n = 0; for (unsigned w = 0; w < T; ++w) n += ids[w][p].size();
                     if (!n) continue;
-                    auto& P = idt.parts[p];
-                    IdEntry empty{}; empty.key.len = EMPTY_LEN;
-                    // pass 1: dedup the sides (n >= distinct IDs) in a roomy scratch table
-                    std::vector<IdEntry> scratch(n + n / 2 + 16, empty);
+                    KeyMap scratch; scratch.build(n);
                     for (unsigned w = 0; w < T; ++w) {
-                        for (const Side& sd : ids[w][p]) {
-                            bool fresh; IdEntry* e = IdTable::upsert(scratch, scratch.size(), Name::make(sd.s, sd.h), fresh);
-                            if (fresh) e->key.aux = P.count++;
+                        for (uint64_t k : ids[w][p]) {
+                            bool fresh; KeyMap::E* e = scratch.upsert(k, khash(k), fresh);
+                            if (fresh) { e->v = localKeys[p].size(); localKeys[p].push_back(k); }
                         }
-                        std::vector<Side>().swap(ids[w][p]);
+                        std::vector<uint64_t>().swap(ids[w][p]);
                     }
-                    // pass 2: the final table at ~60% load
-                    P.cap = P.count + P.count * 2 / 3 + 8;
-                    P.tab.assign(P.cap, empty);
-                    byLocal[p].resize(P.count);
-                    for (const IdEntry& e : scratch)
-                        if (e.key.len != EMPTY_LEN) { bool fresh; byLocal[p][e.key.aux] = IdTable::upsert(P.tab, P.cap, e.key, fresh); }
+                    KeyMap& P = idParts[p];
+                    P.build(localKeys[p].size());
+                    for (size_t i = 0; i < localKeys[p].size(); ++i) {
+                        bool fresh; KeyMap::E* e = P.upsert(localKeys[p][i], khash(localKeys[p][i]), fresh); e->v = i; // local index for now
+                    }
+                    count[p] = static_cast<uint32_t>(localKeys[p].size());
                 }
             });
-            lap("tables");
-            uint32_t G = 0;
-            for (auto& P : idt.parts) { P.base = G; G += P.count; }
-            std::vector<IdEntry*> gent(G);
-            for (uint32_t p = 0; p < NID; ++p) for (size_t i = 0; i < byLocal[p].size(); ++i) gent[idt.parts[p].base + i] = byLocal[p][i];
-            auto gid = [&](const Side& s) { return idt.parts[IdTable::part_of(s.h)].base + idt.find(s.s, s.h)->key.aux; };
-            // resolve both sides of every link in parallel; the union loop then touches integers only
+            for (uint32_t p = 0; p < NID; ++p) base[p + 1] = base[p] + count[p];
+            const uint32_t G = base[NID];
+            std::vector<uint64_t> gkey(G);
+            for (uint32_t p = 0; p < NID; ++p) std::copy(localKeys[p].begin(), localKeys[p].end(), gkey.begin() + base[p]);
+            auto gid = [&](uint64_t k) { uint64_t h = khash(k); uint32_t p = part_of(h, ID_BITS); return base[p] + static_cast<uint32_t>(idParts[p].find(k, h)->v); };
             std::vector<std::vector<std::pair<uint32_t, uint32_t>>> edges(T);
             run_threads(T, [&](unsigned t) {
                 edges[t].reserve(pairs[t].size());
-                for (const auto& [sa, sb] : pairs[t]) edges[t].emplace_back(gid(sa), gid(sb));
+                for (const auto& [a, b] : pairs[t]) edges[t].emplace_back(gid(a), gid(b));
             });
-            // Lock-free union-find: a root only ever gets linked under a smaller index, by CAS,
-            // so no cycle can form; finds compress paths by halving with CAS.
+            // Lock-free union-find: a root is only linked under a smaller index (CAS), so no
+            // cycle can form; finds halve paths with CAS.
             std::unique_ptr<std::atomic<uint32_t>[]> parent(new std::atomic<uint32_t>[G]);
             std::unique_ptr<std::atomic<uint32_t>[]> best(new std::atomic<uint32_t>[G]);
             run_threads(T, [&](unsigned t) {
@@ -693,62 +772,58 @@ int main() {
                     }
                 }
             });
-            lap("union");
-            // smallest name per component: CAS-min on the root's slot (byte-wise comparison)
+            // smallest ID (byte-wise) per component: CAS-min on the root's slot
             std::vector<uint32_t> root(G);
             run_threads(T, [&](unsigned t) {
                 for (uint32_t i = t; i < G; i += T) {
                     uint32_t r = findr(i); root[i] = r;
                     if (r == i) continue;
-                    sv mine = gent[i]->key.view();
                     uint32_t cur = best[r].load(std::memory_order_relaxed);
-                    while (mine < gent[cur]->key.view() && !best[r].compare_exchange_weak(cur, i, std::memory_order_relaxed)) {}
+                    while (key_less(gkey[i], gkey[cur]) && !best[r].compare_exchange_weak(cur, i, std::memory_order_relaxed)) {}
                 }
             });
-            run_threads(T, [&](unsigned t) {
-                for (uint32_t i = t; i < G; i += T) { gent[i]->canon = gent[best[root[i]].load(std::memory_order_relaxed)]->key; gent[i]->canon.aux = 0; }
+            // ID table values become the person key
+            std::atomic<uint32_t> np2{0};
+            run_threads(T, [&](unsigned) {
+                for (uint32_t p; (p = np2.fetch_add(1)) < NID;)
+                    for (KeyMap::E& e : idParts[p].t)
+                        if (e.k != KeyMap::EMPTY) e.v = gkey[best[root[base[p] + e.v]].load(std::memory_order_relaxed)];
             });
-            lap("canon");
             fprintf(stderr, "links: ids=%u\n", G);
         }
-        // user_id -> person name (the smallest ID of the component, or the ID itself)
-        auto resolve = [&](sv user, uint64_t h) -> Name {
-            const IdEntry* e = idt.find(user, h);
-            return e ? e->canon : Name::make(user, h);
-        };
 
         size_t eventBytes = 0, clickBytes = 0;
         std::vector<Mapping> eventMaps = map_csv_dir(data / "events"), clickMaps = map_csv_dir(data / "clicks");
         eventBytes = total_bytes(eventMaps); clickBytes = total_bytes(clickMaps);
-        // ~85 bytes per generated event line, ~55 per click line; arenas fall back to malloc if short
+        // ~70 bytes per generated event line, ~45 per click line; arenas fall back to malloc if short
         Arena erecArena, pevArena, pclArena;
-        erecArena.init(eventBytes / 85 * sizeof(ERec) * 5 / 4 + Arena::SLAB * 4 * T);
-        pevArena.init(eventBytes / 85 * sizeof(PEv) * 5 / 4 + Arena::SLAB * 4 * T);
-        pclArena.init(clickBytes / 55 * sizeof(PCl) * 5 / 4 + Arena::SLAB * 4 * T);
-        BGrid<PEv, 1024> pev(T, std::vector<BlockList<PEv, 1024>>(NP));
-        BGrid<PCl, 512> pcl(T, std::vector<BlockList<PCl, 512>>(NP));
+        erecArena.init(eventBytes / 70 * sizeof(ERec) * 5 / 4 + Arena::SLAB * 4 * T);
+        pevArena.init(eventBytes / 70 * sizeof(PEv) * 5 / 4 + Arena::SLAB * 4 * T);
+        pclArena.init(clickBytes / 45 * sizeof(PCl) * 5 / 4 + Arena::SLAB * 4 * T);
+        BGrid<PEv, 2048> pev(T, std::vector<BlockList<PEv, 2048>>(NP));
+        BGrid<PCl, 1024> pcl(T, std::vector<BlockList<PCl, 1024>>(NP));
         constexpr int BATCH = 16; // rows whose hash-table lines are prefetched together
 
         // ---- events: parse + validate + partition by event_id ----
         {
-            BGrid<ERec, 512> erec(T, std::vector<BlockList<ERec, 512>>(ND));
+            BGrid<ERec, 1024> erec(T, std::vector<BlockList<ERec, 1024>>(ND));
             {
                 Phase ph("events_parse");
                 auto chunks = make_chunks(eventMaps, chunk_bytes(4u << 20));
                 std::atomic<size_t> next{0};
                 run_threads(T, [&](unsigned t) {
-                    auto& out = erec[t];
-                    SlabAlloc al{&erecArena};
-                    struct Pend { ERec r; sv user, prod; uint64_t ph; uint32_t part; };
+                    Scatter<ERec, 4, 1024> sc; sc.init(&erec[t], &erecArena);
+                    struct Pend { ERec r; sv prod; uint64_t uh; uint32_t part; };
                     Pend pend[BATCH]; int npend = 0;
                     auto drain = [&] {
                         for (int k = 0; k < npend; ++k) {
                             Pend& x = pend[k];
-                            uint32_t ts = x.r.name.aux;
-                            x.r.name = resolve(x.user, x.r.name.h); x.r.name.aux = ts;
-                            int64_t c = products.find(x.prod, x.ph);
-                            x.r.cat = static_cast<uint8_t>(c < 0 ? unknownCat : static_cast<uint32_t>(c));
-                            out[x.part].push_stream(x.r, al);
+                            x.r.person = resolve_h(x.r.person, x.uh);
+                            if (x.r.price_cat) {
+                                int64_t c = products.find(x.prod);
+                                x.r.price_cat |= static_cast<uint32_t>(c < 0 ? 0 : c) << 24; // 0 = unknown
+                            }
+                            sc.push(x.part, x.r);
                         }
                         npend = 0;
                     };
@@ -757,71 +832,63 @@ int main() {
                             if (f[0].empty()) return;
                             int64_t ingest;
                             if (!parse_f1(f[3], ingest)) return; // ingest_ts is always valid F1
-                            uint64_t h = hash_sv(f[0]);
                             ERec r;
-                            r.eid = f[0].data(); r.eidLen = static_cast<uint32_t>(f[0].size());
-                            r.eidHash = static_cast<uint32_t>(h); r.ingest = ingest;
-                            r.valid = 0; r.price = 0; r.type = 0; r.cat = 0; r.pad = 0;
-                            const uint32_t part = static_cast<uint32_t>(h >> (64 - ND_BITS));
-                            int64_t ts;
+                            r.eid = key_of(f[0]); r.ingest = ingest; r.person = NO_KEY; r.ts = 0; r.price_cat = 0;
+                            const uint32_t part = part_of(khash(r.eid), ND_BITS);
+                            int64_t ts; bool valid = false; uint32_t price = 0;
                             do {
                                 if (f[1].empty() || f[5].empty()) break;
                                 if (!parse_timestamp(f[2], ts) || ts < ws || ts >= we) break;
                                 sv ty = f[4];
-                                if (ty == "view") r.type = 0; else if (ty == "cart") r.type = 1; else if (ty == "purchase") r.type = 2; else break;
-                                if (r.type == 2) {
+                                if (ty == "purchase") {
                                     uint64_t p;
                                     if (!parse_u64_ascii(f[6], p) || p < 1 || p > 10'000'000) break;
-                                    r.price = static_cast<uint32_t>(p);
-                                }
+                                    price = static_cast<uint32_t>(p);
+                                } else if (ty != "view" && ty != "cart") break;
                                 if (ingest - ts > LATE_MS) break;
-                                r.valid = 1;
+                                valid = true;
                             } while (false);
-                            if (!r.valid) { r.name.h = 0; r.name.len = 0; r.name.aux = 0; out[part].push_stream(r, al); return; }
+                            if (!valid) { sc.push(part, r); return; }
                             Pend& x = pend[npend++];
-                            x.r = r; x.user = f[1]; x.prod = f[5]; x.part = part;
-                            x.r.name.h = hash_sv(f[1]); x.r.name.aux = static_cast<uint32_t>(ts - cws);
-                            x.ph = hash_sv(f[5]);
-                            idt.prefetch(x.r.name.h); products.prefetch(x.ph);
+                            x.r = r; x.part = part; x.prod = f[5];
+                            x.r.person = key_of(f[1]); x.uh = khash(x.r.person);
+                            x.r.ts = static_cast<uint32_t>(ts - cws); x.r.price_cat = price;
+                            id_prefetch(x.uh);
+                            if (price) products.prefetch(f[5]);
                             if (npend == BATCH) drain();
                         });
                         drain();
                     }
-#ifdef __AVX2__
-                    _mm_sfence();
-#endif
+                    sc.finish();
                 });
             }
             {
                 Phase ph("events_dedup");
                 std::atomic<uint32_t> np{0};
                 run_threads(T, [&](unsigned t) {
-                    std::vector<uint32_t> slots; std::vector<const ERec*> best;
-                    auto& out = pev[t];
-                    SlabAlloc al{&pevArena};
+                    Scatter<PEv, 8, 2048> sc; sc.init(&pev[t], &pevArena);
+                    struct Slot { uint64_t eid; const ERec* r; };
+                    std::vector<Slot> slots;
                     for (uint32_t p; (p = np.fetch_add(1)) < ND;) {
                         size_t n = 0; for (unsigned w = 0; w < T; ++w) n += erec[w][p].size();
+                        if (!n) continue;
                         size_t cap = 16; while (cap < n * 2) cap <<= 1;
-                        slots.assign(cap, 0); best.clear();
+                        slots.assign(cap, Slot{0, nullptr});
                         const uint64_t mask = cap - 1;
                         for (unsigned w = 0; w < T; ++w)
                             erec[w][p].each([&](const ERec& r) {
-                                for (uint64_t q = r.eidHash & mask;; q = (q + 1) & mask) {
-                                    uint32_t sl = slots[q];
-                                    if (!sl) { best.push_back(&r); slots[q] = static_cast<uint32_t>(best.size()); break; }
-                                    const ERec* b = best[sl - 1];
-                                    if (b->eidHash == r.eidHash && b->eidLen == r.eidLen && std::memcmp(b->eid, r.eid, r.eidLen) == 0) {
-                                        if (r.ingest < b->ingest) best[sl - 1] = &r; // earliest ingest_ts wins
-                                        break;
-                                    }
+                                for (uint64_t q = khash(r.eid) & mask;; q = (q + 1) & mask) {
+                                    Slot& s = slots[q];
+                                    if (!s.r) { s.eid = r.eid; s.r = &r; break; }
+                                    if (s.eid == r.eid) { if (r.ingest < s.r->ingest) s.r = &r; break; } // earliest ingest_ts wins
                                 }
                             });
-                        for (const ERec* r : best) {
-                            if (!r->valid) continue; // the kept copy decides: an invalid one drops the event
-                            PEv e; e.name = r->name; e.price = r->price; e.type = r->type; e.cat = r->cat; e.pad = 0;
-                            out[ppart(e.name.h)].push(e, al);
+                        for (const Slot& s : slots) {
+                            if (!s.r || s.r->person == NO_KEY) continue; // the kept copy decides
+                            sc.push(part_of(khash(s.r->person), NP_BITS), PEv{s.r->person, s.r->ts, s.r->price_cat});
                         }
                     }
+                    sc.finish();
                 });
             }
             erecArena.release();
@@ -833,16 +900,14 @@ int main() {
             auto chunks = make_chunks(clickMaps, chunk_bytes(4u << 20));
             std::atomic<size_t> next{0};
             run_threads(T, [&](unsigned t) {
-                auto& out = pcl[t];
-                SlabAlloc al{&pclArena};
-                struct Pend { PCl k; sv user; };
+                Scatter<PCl, 8, 1024> sc; sc.init(&pcl[t], &pclArena);
+                struct Pend { PCl k; uint64_t uh; };
                 Pend pend[BATCH]; int npend = 0;
                 auto drain = [&] {
                     for (int k = 0; k < npend; ++k) {
                         Pend& x = pend[k];
-                        uint32_t ts = x.k.name.aux;
-                        x.k.name = resolve(x.user, x.k.name.h); x.k.name.aux = ts;
-                        out[ppart(x.k.name.h)].push(x.k, al);
+                        x.k.person = resolve_h(x.k.person, x.uh);
+                        sc.push(part_of(khash(x.k.person), NP_BITS), x.k);
                     }
                     npend = 0;
                 };
@@ -854,14 +919,14 @@ int main() {
                         int64_t c = campaigns.find(f[2]);
                         if (c < 0) return;
                         Pend& x = pend[npend++];
-                        x.user = f[1];
-                        x.k.name.h = hash_sv(f[1]); x.k.name.aux = static_cast<uint32_t>(ts - cws);
-                        x.k.cid = f[0].data(); x.k.cidLen = static_cast<uint32_t>(f[0].size()); x.k.camp = static_cast<uint32_t>(c);
-                        idt.prefetch(x.k.name.h);
+                        x.k.person = key_of(f[1]); x.uh = khash(x.k.person);
+                        x.k.cid = key_of(f[0]); x.k.ts = static_cast<uint32_t>(ts - cws); x.k.camp = static_cast<uint32_t>(c);
+                        id_prefetch(x.uh);
                         if (npend == BATCH) drain();
                     });
                     drain();
                 }
+                sc.finish();
             });
         }
 
@@ -888,11 +953,12 @@ int main() {
                 auto& agg = campAgg[t]; agg.assign(dayCount * stride, CampAgg{});
                 std::vector<Column> cols = user_columns();
                 size_t& rows = userRows[t];
-                std::vector<uint32_t> slots;       // name -> local person id
-                std::vector<Name> persons;
-                std::vector<uint32_t> evPid, clPid, evOff, clOff;
-                struct EK { uint32_t ts, price; uint8_t type, cat; uint16_t pad; };
-                struct CK { uint32_t ts, camp; const char* cid; uint32_t cidLen; };
+                struct PSlot { uint64_t key; uint32_t pid; };
+                std::vector<PSlot> slots;
+                std::vector<uint64_t> persons;
+                std::vector<uint32_t> evPid, clPid, evOff, clOff, fill;
+                struct EK { uint32_t ts, price_cat; };
+                struct CK { uint32_t ts, camp; uint64_t cid; };
                 std::vector<EK> ev; std::vector<CK> cl;
                 std::vector<uint32_t> count(C, 0), pos(C, 0), active;
                 std::vector<std::pair<uint8_t, uint64_t>> catSum;
@@ -902,47 +968,46 @@ int main() {
                     for (unsigned w = 0; w < T; ++w) { ne += pev[w][p].size(); nc += pcl[w][p].size(); }
                     if (!ne) continue;
                     size_t cap = 16; while (cap < ne * 2) cap <<= 1;
-                    slots.assign(cap, 0); persons.clear();
+                    slots.assign(cap, PSlot{0, 0xFFFFFFFFu}); persons.clear();
                     const uint64_t mask = cap - 1;
-                    auto pid_of = [&](const Name& nm, bool insert) -> int64_t {
-                        for (uint64_t q = (nm.h ^ (nm.h >> 29)) & mask;; q = (q + 1) & mask) {
-                            uint32_t sl = slots[q];
-                            if (!sl) {
-                                if (!insert) return -1;
-                                persons.push_back(nm); slots[q] = static_cast<uint32_t>(persons.size());
-                                return static_cast<int64_t>(persons.size() - 1);
+                    auto pid_of = [&](uint64_t key, bool insert) -> uint32_t {
+                        for (uint64_t q = khash(key) & mask;; q = (q + 1) & mask) {
+                            PSlot& s = slots[q];
+                            if (s.pid == 0xFFFFFFFFu) {
+                                if (!insert) return 0xFFFFFFFFu;
+                                s.key = key; s.pid = static_cast<uint32_t>(persons.size()); persons.push_back(key);
+                                return s.pid;
                             }
-                            if (persons[sl - 1].eq(nm)) return sl - 1;
+                            if (s.key == key) return s.pid;
                         }
                     };
                     // counting sort events by person
                     evPid.clear(); evPid.reserve(ne);
-                    for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { evPid.push_back(static_cast<uint32_t>(pid_of(e.name, true))); });
+                    for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { evPid.push_back(pid_of(e.person, true)); });
                     const size_t P = persons.size();
                     evOff.assign(P + 1, 0);
                     for (uint32_t x : evPid) evOff[x + 1]++;
                     for (size_t k = 0; k < P; ++k) evOff[k + 1] += evOff[k];
                     ev.resize(ne);
+                    fill.assign(evOff.begin(), evOff.end() - 1);
                     {
-                        std::vector<uint32_t> fill(evOff.begin(), evOff.end() - 1);
                         size_t idx = 0;
-                        for (unsigned w = 0; w < T; ++w)
-                            pev[w][p].each([&](const PEv& e) { ev[fill[evPid[idx++]]++] = EK{e.name.aux, e.price, e.type, e.cat, 0}; });
+                        for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { ev[fill[evPid[idx++]]++] = EK{e.ts, e.price_cat}; });
                     }
                     // counting sort clicks by person (clicks of people without events are dropped)
                     clPid.clear(); clPid.reserve(nc);
-                    for (unsigned w = 0; w < T; ++w) pcl[w][p].each([&](const PCl& c) { clPid.push_back(static_cast<uint32_t>(pid_of(c.name, false))); });
+                    for (unsigned w = 0; w < T; ++w) pcl[w][p].each([&](const PCl& c) { clPid.push_back(pid_of(c.person, false)); });
                     clOff.assign(P + 1, 0);
                     for (uint32_t x : clPid) if (x != 0xFFFFFFFFu) clOff[x + 1]++;
                     for (size_t k = 0; k < P; ++k) clOff[k + 1] += clOff[k];
                     cl.resize(clOff[P]);
+                    fill.assign(clOff.begin(), clOff.end() - 1);
                     {
-                        std::vector<uint32_t> fill(clOff.begin(), clOff.end() - 1);
                         size_t idx = 0;
                         for (unsigned w = 0; w < T; ++w)
                             pcl[w][p].each([&](const PCl& c) {
                                 uint32_t x = clPid[idx++];
-                                if (x != 0xFFFFFFFFu) cl[fill[x]++] = CK{c.name.aux, c.camp, c.cid, c.cidLen};
+                                if (x != 0xFFFFFFFFu) cl[fill[x]++] = CK{c.ts, c.camp, c.cid};
                             });
                     }
                     for (size_t pid = 0; pid < P; ++pid) {
@@ -951,10 +1016,9 @@ int main() {
                         if (ee - eb > 1) std::sort(ev.begin() + eb, ev.begin() + ee, [](const EK& a, const EK& b) { return a.ts < b.ts; });
                         if (ce - cb > 1) std::sort(cl.begin() + cb, cl.begin() + ce, [](const CK& a, const CK& b) {
                             if (a.ts != b.ts) return a.ts < b.ts;
-                            int r = std::memcmp(a.cid, b.cid, std::min(a.cidLen, b.cidLen));
-                            return r != 0 ? r < 0 : a.cidLen < b.cidLen;
+                            return key_less(a.cid, b.cid);
                         });
-                        const sv name = persons[pid].view();
+                        const std::string name = key_str(persons[pid]);
 
                         size_t lo = cb, hi = cb, runStart = cb;
                         uint64_t udSessions = 0, udEvents = 0, udRevenue = 0; int64_t udDay = -1;
@@ -1000,11 +1064,13 @@ int main() {
                                 const uint32_t ts = ev[i].ts;
                                 if (ts - prev > SESSION_GAP_MS) break; // equal timestamps never split
                                 prev = ts; ++sEvents;
-                                if (ev[i].type == 2) {
-                                    sPurchase = true; sRevenue += ev[i].price;
-                                    uint8_t c = ev[i].cat; bool found = false;
-                                    for (auto& cs : catSum) if (cs.first == c) { cs.second += ev[i].price; found = true; break; }
-                                    if (!found) catSum.emplace_back(c, ev[i].price);
+                                const uint32_t pc = ev[i].price_cat;
+                                if (pc) {
+                                    const uint32_t price = pc & 0xFFFFFFu; const uint8_t c = static_cast<uint8_t>(pc >> 24);
+                                    sPurchase = true; sRevenue += price;
+                                    bool found = false;
+                                    for (auto& cs : catSum) if (cs.first == c) { cs.second += price; found = true; break; }
+                                    if (!found) catSum.emplace_back(c, price);
                                 }
                             }
                             ++udSessions; udEvents += sEvents; udRevenue += sRevenue;
@@ -1036,8 +1102,8 @@ int main() {
                         a.sessions += x.sessions; a.purchasing += x.purchasing; a.revenue += x.revenue; a.assisted += x.assisted;
                     }
                     if (a.sessions == 0 && a.assisted == 0) continue;
-                    cols[0].put_str(c == ORGANIC ? sv("organic") : campNames[c]);
-                    cols[1].put_str(c == ORGANIC ? sv("organic") : channels[c]);
+                    cols[0].put_str(c == ORGANIC ? sv("organic") : sv(campNames[c]));
+                    cols[1].put_str(c == ORGANIC ? sv("organic") : sv(channels[c]));
                     cols[2].put_i32(static_cast<int32_t>(firstDay + day));
                     cols[3].put_i64(static_cast<int64_t>(a.sessions)); cols[4].put_i64(static_cast<int64_t>(a.purchasing));
                     cols[5].put_i64(static_cast<int64_t>(a.revenue)); cols[6].put_i64(static_cast<int64_t>(a.assisted));
