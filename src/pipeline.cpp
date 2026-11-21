@@ -163,46 +163,76 @@ static void run_threads(unsigned n, Fn&& fn) {
 }
 
 // --------------------------------- CSV scan --------------------------------
-// The dialect: only '\n' ends a line; a field is either quote-free, or wrapped in
-// exactly one pair of quotes with no quote inside. Anything else is malformed, as is
-// a line with the wrong number of fields (an empty line included).
+// Quotes in bits [a, b) of the 128-bit word hi:lo (0 <= a <= b <= 128).
+static inline int popcnt_range(uint64_t lo, uint64_t hi, unsigned a, unsigned b) {
+    int c = 0;
+    if (a < 64) { uint64_t m = lo >> a; unsigned n = std::min(b, 64u) - a; if (n < 64) m &= (uint64_t(1) << n) - 1; c += __builtin_popcountll(m); }
+    if (b > 64) { unsigned a2 = a > 64 ? a - 64 : 0, n = b - 64 - a2; uint64_t m = hi >> a2; if (n < 64) m &= (uint64_t(1) << n) - 1; c += __builtin_popcountll(m); }
+    return c;
+}
+// Masks of ',' or '\n' (sep) and of '"' (quo) for 64 bytes at p.
+static inline void block_masks(const char* p, uint64_t& sep, uint64_t& quo) {
+#ifdef __AVX2__
+    const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
+    __m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    __m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+    uint32_t s0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(x0, vc), _mm256_cmpeq_epi8(x0, vn))));
+    uint32_t s1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(x1, vc), _mm256_cmpeq_epi8(x1, vn))));
+    uint32_t q0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vq)));
+    uint32_t q1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vq)));
+    sep = (uint64_t(s1) << 32) | s0; quo = (uint64_t(q1) << 32) | q0;
+#else
+    sep = quo = 0;
+    for (int i = 0; i < 64; ++i) {
+        if (p[i] == ',' || p[i] == '\n') sep |= uint64_t(1) << i;
+        if (p[i] == '"') quo |= uint64_t(1) << i;
+    }
+#endif
+}
+// The dialect: only '\n' ends a line; a field is either quote-free, or wrapped in exactly one
+// pair of quotes with no quote inside. Anything else is malformed, as is a line with the wrong
+// number of fields (an empty line included). The loop stops only at ',' and '\n'; a field's
+// quotes are counted from the quote masks of the current and previous 64-byte blocks.
 template <size_t N, class Fn>
 static void scan_lines(sv chunk, Fn&& fn) {
     const char* base = chunk.data();
     const char* end = base + chunk.size();
     std::array<sv, N> f;
-    size_t fi = 0; const char* fs_ = base; const char* ls = base; int q = 0; const char* q0 = nullptr; const char* q1 = nullptr; bool bad = false;
+    size_t fi = 0; const char* fs_ = base; const char* ls = base; bool bad = false;
+    uintptr_t curB = 0; uint64_t curQ = 0, prevQ = 0;
+    auto count_q = [&](const char* a, const char* b) -> int {
+        uintptr_t ua = reinterpret_cast<uintptr_t>(a), ub = reinterpret_cast<uintptr_t>(b);
+        if (ua + 64 >= curB && ub <= curB + 64)
+            return popcnt_range(prevQ, curQ, static_cast<unsigned>(ua + 64 - curB), static_cast<unsigned>(ub + 64 - curB));
+        int c = 0; for (const char* x = a; x < b; ++x) c += (*x == '"'); return c; // a long field
+    };
     auto end_field = [&](const char* fe) {
         if (fi >= N) { bad = true; return; }
+        int q = count_q(fs_, fe);
         if (q == 0) f[fi] = sv(fs_, static_cast<size_t>(fe - fs_));
-        else if (q == 2 && q0 == fs_ && q1 == fe - 1) f[fi] = sv(fs_ + 1, static_cast<size_t>(fe - fs_ - 2));
+        else if (q == 2 && fe - fs_ >= 2 && *fs_ == '"' && fe[-1] == '"') f[fi] = sv(fs_ + 1, static_cast<size_t>(fe - fs_ - 2));
         else { bad = true; return; }
         ++fi;
     };
-    auto on_char = [&](const char* c) {
-        char ch = *c;
-        if (ch == ',') { if (!bad) end_field(c); fs_ = c + 1; q = 0; }
-        else if (ch == '"') { if (q == 0) q0 = c; else if (q == 1) q1 = c; ++q; }
-        else { // '\n'
-            if (!bad) { end_field(c); if (!bad && fi == N) fn(f); }
-            fi = 0; fs_ = ls = c + 1; q = 0; bad = false;
+    alignas(64) char tail[64];
+    for (const char* b = base; b < end; b += 64) {
+        uint64_t sep, quo;
+        if (b + 64 <= end) block_masks(b, sep, quo);
+        else {
+            size_t n = static_cast<size_t>(end - b);
+            std::memset(tail, 0, 64); std::memcpy(tail, b, n);
+            block_masks(tail, sep, quo);
         }
-    };
-    const char* b = base;
-#ifdef __AVX2__
-    const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
-    for (; b + 64 <= end; b += 64) {
-        __m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
-        __m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 32));
-        uint32_t m0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(
-            _mm256_cmpeq_epi8(x0, vc), _mm256_cmpeq_epi8(x0, vq)), _mm256_cmpeq_epi8(x0, vn))));
-        uint32_t m1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(
-            _mm256_cmpeq_epi8(x1, vc), _mm256_cmpeq_epi8(x1, vq)), _mm256_cmpeq_epi8(x1, vn))));
-        uint64_t m = (static_cast<uint64_t>(m1) << 32) | m0;
-        while (m) { on_char(b + __builtin_ctzll(m)); m &= m - 1; }
+        prevQ = curQ; curQ = quo; curB = reinterpret_cast<uintptr_t>(b);
+        while (sep) {
+            const char* c = b + __builtin_ctzll(sep); sep &= sep - 1;
+            if (*c == ',') { if (!bad) end_field(c); fs_ = c + 1; }
+            else {
+                if (!bad) { end_field(c); if (!bad && fi == N) fn(f); }
+                fi = 0; fs_ = ls = c + 1; bad = false;
+            }
+        }
     }
-#endif
-    for (; b < end; ++b) { char ch = *b; if (ch == ',' || ch == '"' || ch == '\n') on_char(b); }
     if (ls < end) { // final line without '\n' (its last field may be empty)
         if (!bad) { end_field(end); if (!bad && fi == N) fn(f); }
     }
