@@ -1,0 +1,5 @@
+.git
+scripts/__pycache__
+*.parquet
+data/
+out/

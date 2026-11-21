@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: Polars
+Engine: C++ (native, no dependencies)
