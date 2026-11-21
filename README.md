@@ -28,7 +28,7 @@ docker run --rm --network none \
 
 The image installs Polars at build time. The runtime needs no network. All intermediate files are written to `/scratch`; the only final data files are Parquet files under `/output/user_daily/` and `/output/campaign_daily/`.
 
-Each run writes per-phase timings to stderr in `timing phase=<name> elapsed_ms=<milliseconds> status=<completed|failed>` format. The C++ pipeline reports manifest setup, lookups, links, event and click processing, partitioning, bucket processing, campaign aggregation, and total runtime. The converter separately reports output preparation, each Parquet write, cleanup, and total conversion time. Capture the measurements while running the image with:
+Each run writes per-phase timings to stderr in `timing phase=<name> elapsed_ms=<milliseconds> status=<completed|failed>` format. The C++ pipeline reports manifest setup, lookups, links, event and click processing, partitioning, event sorting, click sorting, bucket processing (sessionization, aggregation, and user-output writes), campaign aggregation, and total runtime. The three bucket worker timing rows use `scope=summed_worker_time`: their elapsed values sum time across parallel workers and may exceed the bucket stage's wall-clock time. The converter separately reports output preparation, each Parquet write, cleanup, and total conversion time. Capture the measurements while running the image with:
 
 ```bash
 scripts/docker_run.sh /path/to/data /path/to/output 2>timings.log

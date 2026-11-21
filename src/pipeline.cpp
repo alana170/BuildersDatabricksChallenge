@@ -43,6 +43,13 @@ static constexpr int BUCKETS = 64;
 
 static void logmsg(const std::string& s) { std::cerr << s << '\n'; }
 
+static void log_worker_timing(const char* phase, uint64_t elapsedNs) {
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::nanoseconds(elapsedNs));
+    std::cerr << "timing phase=" << phase << " elapsed_ms=" << elapsed.count()
+              << " scope=summed_worker_time status=completed\n";
+}
+
 class PhaseTimer {
 public:
     explicit PhaseTimer(const char* phase)
@@ -966,6 +973,7 @@ int main() {
 
         std::vector<std::vector<CampaignAgg>> bucketAgg(BUCKETS);
         std::atomic<int> next{0};
+        std::atomic<uint64_t> eventSortNs{0}, clickSortNs{0}, bucketProcessNs{0};
         std::mutex errorMutex;
         std::string workerError;
         auto worker=[&]() {
@@ -974,16 +982,33 @@ int main() {
                 if (b>=BUCKETS) break;
                 try {
                     auto& ev=eventBuckets[b]; auto& cl=clickBuckets[b];
+                    auto eventSortStart=std::chrono::steady_clock::now();
                     std::sort(ev.begin(),ev.end(),[](const Event& a,const Event& b){
                         if(a.person!=b.person) return a.person<b.person;
                         return a.ts<b.ts;
                     });
+                    auto eventSortEnd=std::chrono::steady_clock::now();
+                    eventSortNs.fetch_add(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            eventSortEnd-eventSortStart).count()), std::memory_order_relaxed);
+
+                    auto clickSortStart=std::chrono::steady_clock::now();
                     std::sort(cl.begin(),cl.end(),[](const Click& a,const Click& b){
                         if(a.person!=b.person) return a.person<b.person;
                         if(a.ts!=b.ts) return a.ts<b.ts;
                         return a.click_id<b.click_id;
                     });
+                    auto clickSortEnd=std::chrono::steady_clock::now();
+                    clickSortNs.fetch_add(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            clickSortEnd-clickSortStart).count()), std::memory_order_relaxed);
+
+                    auto processStart=std::chrono::steady_clock::now();
                     process_bucket(b,ev,cl,users,lookups,windowStart,dayCount,dayStrings,bucketAgg[b],scratch);
+                    auto processEnd=std::chrono::steady_clock::now();
+                    bucketProcessNs.fetch_add(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            processEnd-processStart).count()), std::memory_order_relaxed);
                 } catch(const std::exception& e) {
                     std::lock_guard<std::mutex> lk(errorMutex);
                     if(workerError.empty()) workerError=e.what();
@@ -997,6 +1022,9 @@ int main() {
             for(auto& t:pool) t.join();
             if(!workerError.empty()) throw std::runtime_error(workerError);
         }
+        log_worker_timing("event_sort_worker_total", eventSortNs.load(std::memory_order_relaxed));
+        log_worker_timing("click_sort_worker_total", clickSortNs.load(std::memory_order_relaxed));
+        log_worker_timing("bucket_process_user_output_worker_total", bucketProcessNs.load(std::memory_order_relaxed));
 
         {
             PhaseTimer timer("campaign_merge_and_write");
