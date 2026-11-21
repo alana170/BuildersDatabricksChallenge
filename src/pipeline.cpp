@@ -1040,12 +1040,20 @@ int main() {
                         size_t cap = 16; while (cap < n * 2) cap <<= 1;
                         slots.assign(cap, Slot{0, nullptr});
                         const uint64_t mask = cap - 1;
+                        // Pass 1: the copy that loses (later ingest_ts; on a tie the later-read copy)
+                        // is marked in place with person = NO_KEY, so it is never emitted.
                         for (unsigned w = 0; w < T; ++w)
-                            erec[w][p].each([&](const ERec& r) {
+                            erec[w][p].each([&](const ERec& cr) {
+                                ERec& r = const_cast<ERec&>(cr); // arena memory owned by this pass
                                 for (uint64_t q = khash(r.eid) & mask;; q = (q + 1) & mask) {
                                     Slot& s = slots[q];
                                     if (!s.r) { s.eid = r.eid; s.r = &r; break; }
-                                    if (s.eid == r.eid) { if (r.ingest < s.r->ingest) s.r = &r; break; } // earliest ingest_ts wins
+                                    if (s.eid == r.eid) { // earliest ingest_ts wins
+                                        ERec* cur = const_cast<ERec*>(s.r);
+                                        if (r.ingest < cur->ingest) { cur->person = NO_KEY; s.r = &r; }
+                                        else r.person = NO_KEY;
+                                        break;
+                                    }
                                 }
                             });
                         const ERec* pend[BATCH]; uint64_t ph[BATCH]; int npend = 0;
@@ -1056,11 +1064,13 @@ int main() {
                             }
                             npend = 0;
                         };
-                        for (const Slot& s : slots) {
-                            if (!s.r || s.r->person == NO_KEY) continue; // the kept copy decides
-                            ph[npend] = khash(s.r->person); id_prefetch(ph[npend]); pend[npend++] = s.r;
-                            if (npend == BATCH) drain();
-                        }
+                        // Pass 2, in storage order: what is left is each event's kept copy, if valid.
+                        for (unsigned w = 0; w < T; ++w)
+                            erec[w][p].each([&](const ERec& r) {
+                                if (r.person == NO_KEY) return; // a losing copy, or an invalid kept copy
+                                ph[npend] = khash(r.person); id_prefetch(ph[npend]); pend[npend++] = &r;
+                                if (npend == BATCH) drain();
+                            });
                         drain();
                     }
                     sc.finish();
