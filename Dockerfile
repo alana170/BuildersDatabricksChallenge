@@ -1,21 +1,13 @@
-# Build the specialized processing engine for the scorer's Cascade Lake-class x86 CPUs.
+# Build one static native binary; run it in an empty image (no shell, no Python, no startup cost).
 FROM debian:bookworm-slim AS build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends g++ libc6-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY src/pipeline.cpp /src/pipeline.cpp
-RUN g++ -std=c++20 -O3 -DNDEBUG -pthread -march=cascadelake -mtune=cascadelake \
+# x86-64-v3 = AVX2/BMI2 (every Cascade Lake has it); tuned for the scorer's Cascade Lake CPUs.
+RUN g++ -std=c++20 -O3 -DNDEBUG -pthread -march=x86-64-v3 -mtune=cascadelake -static \
     -pipe /src/pipeline.cpp -o /pipeline
 
-FROM python:3.12-slim-bookworm
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app \
-    && mkdir -p /app /scratch /output \
-    && chown -R 1000:1000 /scratch /output
-COPY --from=build /pipeline /app/pipeline
-COPY scripts/convert.py /app/convert.py
-COPY run.sh /app/run.sh
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt && chmod +x /app/run.sh
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-WORKDIR /app
+FROM scratch
+COPY --from=build /pipeline /pipeline
 USER 1000:1000
-CMD ["/app/run.sh"]
+CMD ["/pipeline"]

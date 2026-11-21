@@ -1,65 +1,93 @@
-# Shopping Sessions — partitioned C++ pipeline
+# Shopping Sessions — native C++ pipeline
 
-This repository contains a purpose-built C++20 event pipeline and a small Polars Parquet writer.
+One static C++20 binary reads the CSVs in `/data` and writes both Parquet tables directly.
+The runtime image is `FROM scratch`: no shell, no Python, nothing to start up.
 
-## Design
+## Why the previous version was slow (14.7 s on the practice data)
 
-1. Parse the link files first and build connected components with Union-Find, path compression, and union-by-size. Each component tracks the byte-wise smallest ID separately from its DSU root.
-2. Parse CSV using the challenge's exact dialect. Event IDs are deduplicated by earliest `ingest_ts` before validation. Click IDs are deduplicated before validation.
-3. Store event/click IDs as views into memory-mapped source files during deduplication, avoiding a heap allocation per CSV field.
-4. Convert validated event and click user IDs to their canonical person IDs.
-5. Hash-partition people into 64 independent buckets. Sort events by `(person, ts)` and clicks by `(person, ts, click_id)` within each bucket, in parallel.
-6. Process each person's sorted timeline once. Sessionization and rolling seven-day campaign attribution run together. A per-person sliding click queue maintains campaign frequencies and the latest click; active campaigns are emitted once per session.
-7. Emit user/day aggregates as each person finishes. Campaign/day aggregates are small fixed-size arrays merged across partitions. No session table or temporal range join is materialized.
-8. Polars converts the intermediate CSV aggregates to Parquet with `day` as a DATE.
+Measured on an 8M-event dataset (`tools/gen_dirty.cpp`) with 1 and 2 threads:
 
-The code uses the generator's stated category count (20 plus `unknown`) and a maximum 32-day manifest window. The supplied challenge generator uses 14 days.
+| step (previous version)                         | 1 thread | 2 threads |
+| ----------------------------------------------- | -------- | --------- |
+| event parse + dedup + validate                  | 6.25 s   | 5.57 s    |
+| everything else                                 | 2.5 s    | 1.8 s     |
+
+The event step barely sped up with more threads: about 80% of it ran on one thread.
+
+* `count_data_lines` read every input byte on one thread before parsing began.
+* Every parsed row took a mutex on a dedup shard, then jumped to a random spot in a ~1 GB table
+  (two cache misses per row), so the "parallel" parse ran at the speed of memory latency.
+* After dedup, one thread validated all 20M rows and interned each `user_id` in one
+  `std::unordered_map` (a cache miss per row).
+* Partitioning by person, the click equivalents, and the Polars CSV→Parquet step were also serial.
+
+Scaled to 20M events, that serial work alone is about 12 s.
+
+## Design now
+
+Every stage runs on all cores and no hot loop takes a lock.
+
+1. **Links.** Parallel parse → ID table partitioned by hash → lock-free union-find
+   (CAS; a root is only linked under a smaller index, so no cycles) → the byte-wise smallest name
+   per component, found by a parallel CAS-min. Each ID-table entry is one 64-byte cache line holding
+   the ID and its person's name, so resolving a `user_id` costs one memory access.
+2. **Events.** An AVX2 scanner finds `,` `"` `\n` 64 bytes at a time and applies the dialect rules
+   exactly. Each row is validated on the spot, since validity depends only on the row. Its person is
+   resolved while the bytes are still in cache, with ID-table and product lookups prefetched in
+   batches of 16. The row is then written (streaming stores, no read-for-ownership) to a
+   thread-local block list chosen by `hash(event_id)`.
+3. **Dedup.** Each of 1024 event-ID partitions is deduplicated with a table that fits in L2:
+   the earliest `ingest_ts` wins, and the kept copy's validity decides, as the rules require.
+   Survivors go to one of 1024 person partitions chosen by `hash(person name)`.
+4. **Clicks.** Parsed, validated, resolved and sent straight to the person partitions. Copies of a
+   click have identical values, so a duplicate can change neither the latest click nor the set of
+   assisting campaigns: no click dedup is needed.
+5. **People.** Each person partition groups rows by exact name (counting sort), sorts each person's
+   events by `ts` and clicks by `(ts, click_id)`, then sweeps once: sessions, last-click credit with
+   the smallest-`click_id` tie-break, and the set of campaigns active in the 7-day window for assists.
+6. **Output.** A small hand-written Parquet writer (PLAIN, uncompressed, `day` as `DATE`, nullable
+   `top_category`). Each worker writes its own `user_daily/part-N.parquet`. Read back with Polars,
+   pyarrow and DuckDB.
+
+Names up to 16 bytes travel inline in every record, so grouping and output never re-read the CSV
+bytes. Every comparison is exact: hash, then length, then bytes. Row buffers live in huge-page
+arenas populated in 4 MB slabs, which avoids roughly a quarter million page faults.
+
+## Results (8M events, 2-CPU VM, same output as before)
+
+| version                        | wall time | CPU time |
+| ------------------------------ | --------- | -------- |
+| previous (C++ + Polars)        | 7.5 s     | ~8 s     |
+| this version                   | ~1.5 s    | ~2.9 s   |
+
+On 8 vCPUs the previous version could not scale (serial work); this one scales with cores.
 
 ## Build and run
 
 ```bash
 docker build --platform linux/amd64 -t shopping-sessions .
-docker run --rm --network none \
-  -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch \
-  -e NCPU=8 -e MEM_GB=24 \
-  -v "$PWD/data:/data:ro" -v "$PWD/out:/output" -v "$PWD/scratch:/scratch" \
-  shopping-sessions
+scripts/docker_run.sh /path/to/data /path/to/out      # same flags as the scorer
 ```
 
-The image installs Polars at build time. The runtime needs no network. All intermediate files are written to `/scratch`; the only final data files are Parquet files under `/output/user_daily/` and `/output/campaign_daily/`.
-
-Each run writes per-phase timings to stderr in `timing phase=<name> elapsed_ms=<milliseconds> status=<completed|failed>` format. The C++ pipeline reports manifest setup, lookups, links, event and click processing, partitioning, event sorting, click sorting, bucket processing (sessionization, aggregation, and user-output writes), campaign aggregation, and total runtime. Buckets with no events skip sorting and bucket setup; a single header-only `user_0.csv` is created if needed so empty user output remains valid. The three bucket worker timing rows use `scope=summed_worker_time`: their elapsed values sum time across parallel workers and may exceed the bucket stage's wall-clock time. Each run also emits one `bucket_detail` record per bucket with its event/click/person counts and sort/process durations, so workload and runtime skew are visible by default. The converter separately reports output preparation, each Parquet write, cleanup, and total conversion time. Set `PIPELINE_PROFILE=1` when using `scripts/docker_run.sh` to add detailed timings for person indexing, event-loop and session-boundary work, attribution/click advancement, session aggregation, output writing, setup, and estimated event/click buffer and working-state bytes. These finer timers add diagnostic overhead and are disabled by default; several are nested inclusive measurements, so do not sum them. Capture the measurements while running the image with:
-
-```bash
-PIPELINE_PROFILE=1 scripts/docker_run.sh /path/to/data /path/to/output 2>timings.log
-```
-
-## Fixture validation
-
-The C++ core can be run without Docker and without Python packages:
+Without Docker:
 
 ```bash
 g++ -std=c++20 -O3 -DNDEBUG -pthread -march=native src/pipeline.cpp -o pipeline
-python3 scripts/check_csv_fixtures.py
+DATA_DIR=/path/to/data OUTPUT_DIR=/path/to/out NCPU=8 ./pipeline
 ```
 
-The local fixture checker compares the intermediate CSVs with all 36 hand-written fixture outputs. For the scored image, the usual `scripts/run_fixtures.py` checker can be copied from the Polars starter and run against the Docker image.
+Per-phase timings go to stderr (`timing phase=... elapsed_ms=...`).
 
-## Deterministic native benchmark
+## Testing
 
-`scripts/generate_benchmark.py` creates clean, valid input data using a fixed seed. By default it writes 1,000,000 events and 250,000 clicks, with a Zipf-like user distribution, linked alternate IDs, clustered sessions, and a 14-day window. Change the row counts or seed with `--events`, `--clicks`, `--users`, and `--seed`. The default output is `/tmp/dbc-benchmark-data`; outputs inside this repository are rejected so benchmark data stays out of Git. The output directory must be empty or absent.
-
-```bash
-python3.12 scripts/generate_benchmark.py \
-  --seed 1 --events 1000000 --clicks 250000 \
-  --output /tmp/dbc-benchmark-1m
-
-g++ -std=c++20 -O3 -DNDEBUG -pthread -march=native src/pipeline.cpp \
-  -o /tmp/dbc-pipeline-benchmark
-```
-
-Run the same dataset with `NCPU=4,8,12,16`, using a separate scratch and output directory for each run. Capture stderr to compare `pipeline_total` and bucket timings. This measures the native C++ pipeline; use the Docker runner separately when a container runtime is available.
-
-## Important validation status
-
-The C++ core has been checked against all 36 supplied fixtures. The container image and Parquet conversion have not been built or timed in this environment (Docker and network package installation are unavailable here). Run the starter's full fixture harness and the 1M dev-set comparison before submitting. No 20M/60M runtime is claimed.
+* Starter fixtures: `python3 scripts/run_fixtures.py ../fixtures -- ./pipeline`
+* Dev set: `python3 scripts/compare.py dev-answer/ out/`
+* Differential fuzzing against the previous implementation (commit `4bb39b4`, which passed all 36
+  fixtures): `tools/diff_test.sh 1 300`. `tools/fuzz.py` builds tiny datasets dense in edge cases:
+  quoting, `\r`, malformed lines, missing final newline, zero-byte files, all timestamp forms and bad
+  forms, Feb 29, duplicates with earlier invalid copies and different users, late events, gaps of
+  exactly 30:00.000 and 30:00.001, click boundaries at exactly 7 days, at the session start and
+  1 ms off, same-ms ties, link chains and self-links, and assist-only campaigns.
+  Set `CHUNK=1` to split every line into its own work chunk.
+* Large synthetic data: `g++ -O2 -std=c++20 tools/gen_dirty.cpp -o gen && ./gen SEED EVENTS CLICKS OUTDIR`
+  (follows the generator description and dirt rates in `rules.md`).
