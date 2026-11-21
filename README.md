@@ -45,6 +45,21 @@ python3 scripts/check_csv_fixtures.py
 
 The local fixture checker compares the intermediate CSVs with all 36 hand-written fixture outputs. For the scored image, the usual `scripts/run_fixtures.py` checker can be copied from the Polars starter and run against the Docker image.
 
+## Deterministic native benchmark
+
+`scripts/generate_benchmark.py` creates clean, valid input data using a fixed seed. By default it writes 1,000,000 events and 250,000 clicks, with a Zipf-like user distribution, linked alternate IDs, clustered sessions, and a 14-day window. Change the row counts or seed with `--events`, `--clicks`, `--users`, and `--seed`. The default output is `/tmp/dbc-benchmark-data`; outputs inside this repository are rejected so benchmark data stays out of Git. The output directory must be empty or absent.
+
+```bash
+python3.12 scripts/generate_benchmark.py \
+  --seed 1 --events 1000000 --clicks 250000 \
+  --output /tmp/dbc-benchmark-1m
+
+g++ -std=c++20 -O3 -DNDEBUG -pthread -march=native src/pipeline.cpp \
+  -o /tmp/dbc-pipeline-benchmark
+```
+
+Run the same dataset with `NCPU=4,8,12,16`, using a separate scratch and output directory for each run. Capture stderr to compare `pipeline_total` and bucket timings. This measures the native C++ pipeline; use the Docker runner separately when a container runtime is available.
+
 ## Important validation status
 
 The C++ core has been checked against all 36 supplied fixtures. The container image and Parquet conversion have not been built or timed in this environment (Docker and network package installation are unavailable here). Run the starter's full fixture harness and the 1M dev-set comparison before submitting. No 20M/60M runtime is claimed.
