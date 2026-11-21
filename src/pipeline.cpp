@@ -849,6 +849,22 @@ static void sort_by_ts(E* a, size_t n, std::vector<E>& tmp) {
     }
 }
 
+// Stable LSD radix sort of n rows by their 31-bit ts field: three 11-bit digits, whose counts the
+// caller has already filled in hist[0..6143]. A digit shared by every row is skipped. Returns
+// whichever of a / b holds the sorted rows.
+template <class R>
+static R* radix_ts(R* a, R* b, size_t n, uint32_t* hist) {
+    if (n < 2) return a;
+    for (int d = 0; d < 3; ++d) {
+        uint32_t* h = hist + d * 2048; const int sh = 11 * d;
+        if (h[(a[0].ts >> sh) & 2047] == n) continue;
+        uint32_t sum = 0; for (int k = 0; k < 2048; ++k) { const uint32_t v = h[k]; h[k] = sum; sum += v; }
+        for (size_t i = 0; i < n; ++i) b[h[(a[i].ts >> sh) & 2047]++] = a[i];
+        std::swap(a, b);
+    }
+    return a;
+}
+
 // ---------------------------------- main -----------------------------------
 int main() {
     try {
@@ -1206,7 +1222,11 @@ int main() {
                 std::vector<uint32_t> evPid, clPid, evOff, clOff, fill;
                 struct EK { uint32_t ts, price_cat; };
                 struct CK { uint32_t ts, camp; uint64_t cid; };
-                std::vector<EK> ev, evTmp; std::vector<CK> cl;
+                std::vector<EK> ev; std::vector<CK> cl;
+                struct EP { uint32_t ts, pc, pid; };
+                struct CP { uint32_t ts, camp; uint64_t cid; uint32_t pid; };
+                std::vector<EP> epA, epB; std::vector<CP> cpA, cpB;
+                std::vector<uint32_t> hist(3 * 2048);
                 std::vector<uint32_t> count(C, 0), pos(C, 0), active;
                 std::vector<std::pair<uint8_t, uint64_t>> catSum;
                 for (uint32_t oi; (oi = np.fetch_add(1)) < NP;) {
@@ -1228,43 +1248,48 @@ int main() {
                             if (s.key == key) return s.pid;
                         }
                     };
-                    // counting sort events by person
-                    evPid.clear(); evPid.reserve(ne);
-                    for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { evPid.push_back(pid_of(e.person, true)); });
-                    const size_t P = persons.size();
-                    evOff.assign(P + 1, 0);
-                    for (uint32_t x : evPid) evOff[x + 1]++;
-                    for (size_t k = 0; k < P; ++k) evOff[k + 1] += evOff[k];
-                    ev.resize(ne);
-                    fill.assign(evOff.begin(), evOff.end() - 1);
-                    {
-                        size_t idx = 0;
-                        for (unsigned w = 0; w < T; ++w) pev[w][p].each([&](const PEv& e) { ev[fill[evPid[idx++]]++] = EK{e.ts, e.price_cat}; });
-                    }
-                    // counting sort clicks by person (clicks of people without events are dropped)
-                    clPid.clear(); clPid.reserve(nc);
-                    for (unsigned w = 0; w < T; ++w) pcl[w][p].each([&](const PCl& c) { clPid.push_back(pid_of(c.person, false)); });
-                    clOff.assign(P + 1, 0);
-                    for (uint32_t x : clPid) if (x != 0xFFFFFFFFu) clOff[x + 1]++;
-                    for (size_t k = 0; k < P; ++k) clOff[k + 1] += clOff[k];
-                    cl.resize(clOff[P]);
-                    fill.assign(clOff.begin(), clOff.end() - 1);
+                    // Events, then clicks: gathered with their local person id, stably radix-sorted by
+                    // ts (three 11-bit digits; ts < 2^31), then stably scattered by person, so each
+                    // person's rows come out in ts order without a per-person sort.
+                    epA.resize(ne); epB.resize(ne);
+                    std::fill(hist.begin(), hist.end(), 0);
                     {
                         size_t idx = 0;
                         for (unsigned w = 0; w < T; ++w)
-                            pcl[w][p].each([&](const PCl& c) {
-                                uint32_t x = clPid[idx++];
-                                if (x != 0xFFFFFFFFu) cl[fill[x]++] = CK{c.ts, c.camp, c.cid};
+                            pev[w][p].each([&](const PEv& e) {
+                                epA[idx++] = EP{e.ts, e.price_cat, pid_of(e.person, true)};
+                                hist[e.ts & 2047]++; hist[2048 + ((e.ts >> 11) & 2047)]++; hist[4096 + (e.ts >> 22)]++;
                             });
                     }
+                    const EP* es = radix_ts(epA.data(), epB.data(), ne, hist.data());
+                    const size_t P = persons.size();
+                    evOff.assign(P + 1, 0);
+                    for (size_t i = 0; i < ne; ++i) evOff[es[i].pid + 1]++;
+                    for (size_t k = 0; k < P; ++k) evOff[k + 1] += evOff[k];
+                    ev.resize(ne);
+                    fill.assign(evOff.begin(), evOff.end() - 1);
+                    for (size_t i = 0; i < ne; ++i) ev[fill[es[i].pid]++] = EK{es[i].ts, es[i].pc};
+                    // clicks of people without events are dropped
+                    cpA.resize(nc); cpB.resize(nc);
+                    std::fill(hist.begin(), hist.end(), 0);
+                    size_t ncl = 0;
+                    for (unsigned w = 0; w < T; ++w)
+                        pcl[w][p].each([&](const PCl& c) {
+                            const uint32_t x = pid_of(c.person, false);
+                            if (x == 0xFFFFFFFFu) return;
+                            cpA[ncl++] = CP{c.ts, c.camp, c.cid, x};
+                            hist[c.ts & 2047]++; hist[2048 + ((c.ts >> 11) & 2047)]++; hist[4096 + (c.ts >> 22)]++;
+                        });
+                    const CP* cs = radix_ts(cpA.data(), cpB.data(), ncl, hist.data());
+                    clOff.assign(P + 1, 0);
+                    for (size_t i = 0; i < ncl; ++i) clOff[cs[i].pid + 1]++;
+                    for (size_t k = 0; k < P; ++k) clOff[k + 1] += clOff[k];
+                    cl.resize(ncl);
+                    fill.assign(clOff.begin(), clOff.end() - 1);
+                    for (size_t i = 0; i < ncl; ++i) cl[fill[cs[i].pid]++] = CK{cs[i].ts, cs[i].camp, cs[i].cid};
                     for (size_t pid = 0; pid < P; ++pid) {
                         const size_t eb = evOff[pid], ee = evOff[pid + 1];
                         const size_t cb = clOff[pid], ce = clOff[pid + 1];
-                        if (ee - eb > 1) sort_by_ts(ev.data() + eb, ee - eb, evTmp);
-                        if (ce - cb > 1) std::sort(cl.begin() + cb, cl.begin() + ce, [](const CK& a, const CK& b) {
-                            if (a.ts != b.ts) return a.ts < b.ts;
-                            return key_less(a.cid, b.cid);
-                        });
                         const std::string name = key_str(persons[pid]);
 
                         size_t lo = cb, hi = cb, runStart = cb;
@@ -1294,7 +1319,7 @@ int main() {
                             while (hi < ce && cl[hi].ts <= S) {
                                 uint32_t cp = cl[hi].camp;
                                 if (count[cp]++ == 0) { pos[cp] = static_cast<uint32_t>(active.size()); active.push_back(cp); }
-                                if (hi == cb || cl[hi].ts != cl[hi - 1].ts) runStart = hi; // first (smallest id) of the latest ts
+                                if (hi == cb || cl[hi].ts != cl[hi - 1].ts) runStart = hi; // first click of the latest ts
                                 ++hi;
                             }
                             while (lo < hi && static_cast<int64_t>(cl[lo].ts) < cutoff) {
@@ -1302,7 +1327,14 @@ int main() {
                                 if (--count[cp] == 0) { uint32_t mv = active.back(); active[pos[cp]] = mv; pos[mv] = pos[cp]; active.pop_back(); }
                                 ++lo;
                             }
-                            const uint32_t credit = lo < hi ? cl[runStart].camp : ORGANIC;
+                            // latest ts in the window; among clicks at that ts the smallest click_id
+                            // ([runStart, hi) is that run, all inside the window since lo < hi)
+                            uint32_t credit = ORGANIC;
+                            if (lo < hi) {
+                                size_t bi = runStart;
+                                for (size_t k = runStart + 1; k < hi; ++k) if (key_less(cl[k].cid, cl[bi].cid)) bi = k;
+                                credit = cl[bi].camp;
+                            }
                             CampAgg* dayAgg = &agg[static_cast<size_t>(day) * stride];
                             if (credit != ORGANIC) for (uint32_t cp : active) dayAgg[cp].assisted++;
                             uint64_t sRevenue = 0, sEvents = 0; bool sPurchase = false;
