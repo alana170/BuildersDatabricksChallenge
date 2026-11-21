@@ -269,14 +269,35 @@ static int64_t days_from_civil(int y, unsigned m, unsigned d) {
 }
 static inline bool dig(char c) { return c >= '0' && c <= '9'; }
 static inline int d2(const char* s) { return (s[0] - '0') * 10 + (s[1] - '0'); }
+// The calendar part "YYYY-MM-DD" -> days since 1970, or BAD_DATE when it is not a real date.
+static constexpr int64_t BAD_DATE = std::numeric_limits<int64_t>::min();
+static int64_t parse_date10(const char* p) {
+    if (p[4] != '-' || p[7] != '-') return BAD_DATE;
+    if (!(dig(p[0]) && dig(p[1]) && dig(p[2]) && dig(p[3]) && dig(p[5]) && dig(p[6]) && dig(p[8]) && dig(p[9]))) return BAD_DATE;
+    int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8);
+    if (mo < 1 || mo > 12 || d < 1 || d > month_days(y, mo)) return BAD_DATE;
+    return days_from_civil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d));
+}
+// A dataset holds a few weeks of dates, so each thread remembers the dates it has seen
+// (valid or not) in a small direct-mapped table keyed by the ten date bytes.
+struct DateMemo { uint64_t k8 = 0; uint16_t k2 = 0; int64_t days = BAD_DATE; }; // k8 = 0 never matches real text
+static thread_local DateMemo dateMemo[128];
+static inline int64_t date_days(const char* p) {
+    uint64_t k8; uint16_t k2; std::memcpy(&k8, p, 8); std::memcpy(&k2, p + 8, 2);
+    DateMemo& m = dateMemo[((k8 ^ (uint64_t(k2) << 40)) * 0x9E3779B97F4A7C15ULL) >> 57];
+    if (m.k8 == k8 && m.k2 == k2) return m.days;
+    m.k8 = k8; m.k2 = k2; m.days = parse_date10(p);
+    return m.days;
+}
 static bool parse_f1_or_f2(sv s, int64_t& out) {
     if (s.size() != 20 && s.size() != 25) return false;
     const char* p = s.data();
-    if (p[4] != '-' || p[7] != '-' || p[10] != 'T' || p[13] != ':' || p[16] != ':') return false;
-    if (!(dig(p[0]) && dig(p[1]) && dig(p[2]) && dig(p[3]) && dig(p[5]) && dig(p[6]) && dig(p[8]) && dig(p[9]) &&
-          dig(p[11]) && dig(p[12]) && dig(p[14]) && dig(p[15]) && dig(p[17]) && dig(p[18]))) return false;
-    int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), hh = d2(p + 11), mm = d2(p + 14), ss = d2(p + 17);
-    if (mo < 1 || mo > 12 || d < 1 || d > month_days(y, mo) || hh > 23 || mm > 59 || ss > 59) return false;
+    if (p[10] != 'T' || p[13] != ':' || p[16] != ':') return false;
+    if (!(dig(p[11]) && dig(p[12]) && dig(p[14]) && dig(p[15]) && dig(p[17]) && dig(p[18]))) return false;
+    int hh = d2(p + 11), mm = d2(p + 14), ss = d2(p + 17);
+    if (hh > 23 || mm > 59 || ss > 59) return false;
+    int64_t days = date_days(p);
+    if (days == BAD_DATE) return false;
     int off = 0;
     if (s.size() == 20) { if (p[19] != 'Z') return false; }
     else {
@@ -286,7 +307,7 @@ static bool parse_f1_or_f2(sv s, int64_t& out) {
         if (oh > 23 || om > 59) return false;
         off = oh * 60 + om; if (p[19] == '-') off = -off;
     }
-    int64_t sec = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mm * 60 + ss - int64_t(off) * 60;
+    int64_t sec = days * 86400 + hh * 3600 + mm * 60 + ss - int64_t(off) * 60;
     out = sec * 1000; // years are 4 digits, so no overflow is possible
     return true;
 }
@@ -643,6 +664,31 @@ struct Scatter {
     }
 };
 
+// Sort one person's events by ts. Most people have a few dozen events, where insertion sort
+// beats std::sort; the heaviest (whales) get a two-pass LSD radix sort on the 32-bit ts.
+template <class E>
+static void sort_by_ts(E* a, size_t n, std::vector<E>& tmp) {
+    if (n <= 32) {
+        for (size_t i = 1; i < n; ++i) {
+            E x = a[i]; size_t j = i;
+            while (j > 0 && a[j - 1].ts > x.ts) { a[j] = a[j - 1]; --j; }
+            a[j] = x;
+        }
+        return;
+    }
+    if (n < 65536) { std::sort(a, a + n, [](const E& x, const E& y) { return x.ts < y.ts; }); return; }
+    tmp.resize(n);
+    std::vector<uint32_t> cnt(65536);
+    for (int pass = 0; pass < 2; ++pass) {
+        const int sh = pass * 16;
+        E* src = pass == 0 ? a : tmp.data(); E* dst = pass == 0 ? tmp.data() : a;
+        std::fill(cnt.begin(), cnt.end(), 0);
+        for (size_t i = 0; i < n; ++i) cnt[(src[i].ts >> sh) & 0xFFFF]++;
+        uint32_t sum = 0; for (auto& c : cnt) { uint32_t v = c; c = sum; sum += v; }
+        for (size_t i = 0; i < n; ++i) dst[cnt[(src[i].ts >> sh) & 0xFFFF]++] = src[i];
+    }
+}
+
 // ---------------------------------- main -----------------------------------
 int main() {
     try {
@@ -723,14 +769,17 @@ int main() {
             return e ? e->v : k;
         };
         auto id_prefetch = [&](uint64_t h) { idParts[part_of(h, ID_BITS)].prefetch(h); };
+        // The link step runs on a few threads of its own while events are read: events keep their
+        // raw user key until dedup, which is when the ID table is first needed.
+        auto run_links = [&](const unsigned TL) {
         {
             Phase ph("links");
             auto maps = map_csv_dir(data / "links");
             auto chunks = make_chunks(maps, chunk_bytes(1u << 20));
-            std::vector<std::vector<std::pair<uint64_t, uint64_t>>> pairs(T);
-            Grid<uint64_t> ids(T, std::vector<std::vector<uint64_t>>(NID));
+            std::vector<std::vector<std::pair<uint64_t, uint64_t>>> pairs(TL);
+            Grid<uint64_t> ids(TL, std::vector<std::vector<uint64_t>>(NID));
             std::atomic<size_t> next{0};
-            run_threads(T, [&](unsigned t) {
+            run_threads(TL, [&](unsigned t) {
                 for (size_t i; (i = next.fetch_add(1)) < chunks.size();)
                     scan_lines<2>(chunks[i], [&](const std::array<sv, 2>& f) {
                         if (f[0].empty() || f[1].empty()) return;
@@ -744,12 +793,12 @@ int main() {
             std::vector<uint32_t> base(NID + 1, 0), count(NID, 0);
             std::vector<std::vector<uint64_t>> localKeys(NID);
             std::atomic<uint32_t> np{0};
-            run_threads(T, [&](unsigned) {
+            run_threads(TL, [&](unsigned) {
                 for (uint32_t p; (p = np.fetch_add(1)) < NID;) {
-                    size_t n = 0; for (unsigned w = 0; w < T; ++w) n += ids[w][p].size();
+                    size_t n = 0; for (unsigned w = 0; w < TL; ++w) n += ids[w][p].size();
                     if (!n) continue;
                     KeyMap scratch; scratch.build(n);
-                    for (unsigned w = 0; w < T; ++w) {
+                    for (unsigned w = 0; w < TL; ++w) {
                         for (uint64_t k : ids[w][p]) {
                             bool fresh; KeyMap::E* e = scratch.upsert(k, khash(k), fresh);
                             if (fresh) { e->v = localKeys[p].size(); localKeys[p].push_back(k); }
@@ -769,8 +818,8 @@ int main() {
             std::vector<uint64_t> gkey(G);
             for (uint32_t p = 0; p < NID; ++p) std::copy(localKeys[p].begin(), localKeys[p].end(), gkey.begin() + base[p]);
             auto gid = [&](uint64_t k) { uint64_t h = khash(k); uint32_t p = part_of(h, ID_BITS); return base[p] + static_cast<uint32_t>(idParts[p].find(k, h)->v); };
-            std::vector<std::vector<std::pair<uint32_t, uint32_t>>> edges(T);
-            run_threads(T, [&](unsigned t) {
+            std::vector<std::vector<std::pair<uint32_t, uint32_t>>> edges(TL);
+            run_threads(TL, [&](unsigned t) {
                 edges[t].reserve(pairs[t].size());
                 for (const auto& [a, b] : pairs[t]) edges[t].emplace_back(gid(a), gid(b));
             });
@@ -778,8 +827,8 @@ int main() {
             // cycle can form; finds halve paths with CAS.
             std::unique_ptr<std::atomic<uint32_t>[]> parent(new std::atomic<uint32_t>[G]);
             std::unique_ptr<std::atomic<uint32_t>[]> best(new std::atomic<uint32_t>[G]);
-            run_threads(T, [&](unsigned t) {
-                for (uint32_t i = t; i < G; i += T) { parent[i].store(i, std::memory_order_relaxed); best[i].store(i, std::memory_order_relaxed); }
+            run_threads(TL, [&](unsigned t) {
+                for (uint32_t i = t; i < G; i += TL) { parent[i].store(i, std::memory_order_relaxed); best[i].store(i, std::memory_order_relaxed); }
             });
             auto findr = [&](uint32_t x) {
                 for (;;) {
@@ -790,7 +839,7 @@ int main() {
                     x = g;
                 }
             };
-            run_threads(T, [&](unsigned t) {
+            run_threads(TL, [&](unsigned t) {
                 for (const auto& [ga, gb] : edges[t]) {
                     uint32_t a = ga, b = gb;
                     for (;;) {
@@ -804,8 +853,8 @@ int main() {
             });
             // smallest ID (byte-wise) per component: CAS-min on the root's slot
             std::vector<uint32_t> root(G);
-            run_threads(T, [&](unsigned t) {
-                for (uint32_t i = t; i < G; i += T) {
+            run_threads(TL, [&](unsigned t) {
+                for (uint32_t i = t; i < G; i += TL) {
                     uint32_t r = findr(i); root[i] = r;
                     if (r == i) continue;
                     uint32_t cur = best[r].load(std::memory_order_relaxed);
@@ -814,13 +863,17 @@ int main() {
             });
             // ID table values become the person key
             std::atomic<uint32_t> np2{0};
-            run_threads(T, [&](unsigned) {
+            run_threads(TL, [&](unsigned) {
                 for (uint32_t p; (p = np2.fetch_add(1)) < NID;)
                     for (KeyMap::E& e : idParts[p].t)
                         if (e.k != KeyMap::EMPTY) e.v = gkey[best[root[base[p] + e.v]].load(std::memory_order_relaxed)];
             });
             fprintf(stderr, "links: ids=%u\n", G);
         }
+        };
+        const unsigned TL = std::max(1u, T / 4);
+        std::exception_ptr linkErr;
+        std::thread linkThread([&] { try { run_links(TL); } catch (...) { linkErr = std::current_exception(); } });
 
         size_t eventBytes = 0, clickBytes = 0;
         std::vector<Mapping> eventMaps = map_csv_dir(data / "events"), clickMaps = map_csv_dir(data / "clicks");
@@ -843,20 +896,6 @@ int main() {
                 std::atomic<size_t> next{0};
                 run_threads(T, [&](unsigned t) {
                     Scatter<ERec, 4, 1024> sc; sc.init(&erec[t], &erecArena);
-                    struct Pend { ERec r; sv prod; uint64_t uh; uint32_t part; };
-                    Pend pend[BATCH]; int npend = 0;
-                    auto drain = [&] {
-                        for (int k = 0; k < npend; ++k) {
-                            Pend& x = pend[k];
-                            x.r.person = resolve_h(x.r.person, x.uh);
-                            if (x.r.price_cat) {
-                                int64_t c = products.find(x.prod);
-                                x.r.price_cat |= static_cast<uint32_t>(c < 0 ? 0 : c) << 24; // 0 = unknown
-                            }
-                            sc.push(x.part, x.r);
-                        }
-                        npend = 0;
-                    };
                     for (size_t i; (i = next.fetch_add(1)) < chunks.size();) {
                         scan_lines<7>(chunks[i], [&](const std::array<sv, 7>& f) {
                             if (f[0].empty()) return;
@@ -878,21 +917,19 @@ int main() {
                                 if (ingest - ts > LATE_MS) break;
                                 valid = true;
                             } while (false);
-                            if (!valid) { sc.push(part, r); return; }
-                            Pend& x = pend[npend++];
-                            x.r = r; x.part = part; x.prod = f[5];
-                            x.r.person = key_of(f[1]); x.uh = khash(x.r.person);
-                            x.r.ts = static_cast<uint32_t>(ts - cws); x.r.price_cat = price;
-                            id_prefetch(x.uh);
-                            if (price) products.prefetch(f[5]);
-                            if (npend == BATCH) drain();
+                            if (valid) {
+                                r.person = key_of(f[1]); // raw user key; resolved to the person in dedup
+                                r.ts = static_cast<uint32_t>(ts - cws);
+                                if (price) { int64_t c = products.find(f[5]); r.price_cat = price | static_cast<uint32_t>(c < 0 ? 0 : c) << 24; } // 0 = unknown
+                            }
+                            sc.push(part, r);
                         });
-                        drain();
                     }
                     sc.finish();
                 });
             }
             {
+                { Phase pj("links_join"); linkThread.join(); if (linkErr) std::rethrow_exception(linkErr); }
                 Phase ph("events_dedup");
                 std::atomic<uint32_t> np{0};
                 run_threads(T, [&](unsigned t) {
@@ -913,10 +950,20 @@ int main() {
                                     if (s.eid == r.eid) { if (r.ingest < s.r->ingest) s.r = &r; break; } // earliest ingest_ts wins
                                 }
                             });
+                        const ERec* pend[BATCH]; uint64_t ph[BATCH]; int npend = 0;
+                        auto drain = [&] {
+                            for (int k = 0; k < npend; ++k) {
+                                const uint64_t person = resolve_h(pend[k]->person, ph[k]);
+                                sc.push(part_of(khash(person), NP_BITS), PEv{person, pend[k]->ts, pend[k]->price_cat});
+                            }
+                            npend = 0;
+                        };
                         for (const Slot& s : slots) {
                             if (!s.r || s.r->person == NO_KEY) continue; // the kept copy decides
-                            sc.push(part_of(khash(s.r->person), NP_BITS), PEv{s.r->person, s.r->ts, s.r->price_cat});
+                            ph[npend] = khash(s.r->person); id_prefetch(ph[npend]); pend[npend++] = s.r;
+                            if (npend == BATCH) drain();
                         }
+                        drain();
                     }
                     sc.finish();
                 });
@@ -989,7 +1036,7 @@ int main() {
                 std::vector<uint32_t> evPid, clPid, evOff, clOff, fill;
                 struct EK { uint32_t ts, price_cat; };
                 struct CK { uint32_t ts, camp; uint64_t cid; };
-                std::vector<EK> ev; std::vector<CK> cl;
+                std::vector<EK> ev, evTmp; std::vector<CK> cl;
                 std::vector<uint32_t> count(C, 0), pos(C, 0), active;
                 std::vector<std::pair<uint8_t, uint64_t>> catSum;
                 for (uint32_t oi; (oi = np.fetch_add(1)) < NP;) {
@@ -1043,7 +1090,7 @@ int main() {
                     for (size_t pid = 0; pid < P; ++pid) {
                         const size_t eb = evOff[pid], ee = evOff[pid + 1];
                         const size_t cb = clOff[pid], ce = clOff[pid + 1];
-                        if (ee - eb > 1) std::sort(ev.begin() + eb, ev.begin() + ee, [](const EK& a, const EK& b) { return a.ts < b.ts; });
+                        if (ee - eb > 1) sort_by_ts(ev.data() + eb, ee - eb, evTmp);
                         if (ce - cb > 1) std::sort(cl.begin() + cb, cl.begin() + ce, [](const CK& a, const CK& b) {
                             if (a.ts != b.ts) return a.ts < b.ts;
                             return key_less(a.cid, b.cid);
