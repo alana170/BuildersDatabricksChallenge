@@ -43,6 +43,30 @@ static constexpr int BUCKETS = 64;
 
 static void logmsg(const std::string& s) { std::cerr << s << '\n'; }
 
+class PhaseTimer {
+public:
+    explicit PhaseTimer(const char* phase)
+        : phase_(phase), started_(std::chrono::steady_clock::now()),
+          uncaughtOnStart_(std::uncaught_exceptions()) {}
+
+    ~PhaseTimer() {
+        const auto elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started_);
+        std::cerr << "timing phase=" << phase_ << " elapsed_ms=" << elapsed.count()
+                  << " status="
+                  << (std::uncaught_exceptions() > uncaughtOnStart_ ? "failed" : "completed")
+                  << '\n';
+    }
+
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+private:
+    const char* phase_;
+    std::chrono::steady_clock::time_point started_;
+    int uncaughtOnStart_;
+};
+
 // ------------------------- byte hashing / string pool ----------------------
 static inline uint64_t hash_bytes(sv s) noexcept {
     // libstdc++'s string_view hash uses its optimized byte hash (MurmurHash2
@@ -764,31 +788,45 @@ static void process_bucket(
 // ---------------------------------- main ------------------------------------
 int main() {
     try {
+        PhaseTimer pipelineTimer("pipeline_total");
         const char* d = std::getenv("DATA_DIR");
         const char* o = std::getenv("OUTPUT_DIR");
         const char* s = std::getenv("SCRATCH_DIR");
         fs::path data=d?d:"/data", output=o?o:"/output", scratch=s? s:"/scratch";
-        fs::create_directories(scratch);
-        fs::create_directories(output/"user_daily");
-        fs::create_directories(output/"campaign_daily");
-        unsigned threads=get_threads();
-        auto [windowStart,windowEnd]=read_window(data/"manifest.json");
-        uint32_t dayCount=static_cast<uint32_t>((windowEnd-windowStart)/DAY_MS);
-        std::vector<std::string> dayStrings(dayCount);
-        int64_t startDay=windowStart/DAY_MS;
-        for(uint32_t i=0;i<dayCount;++i) dayStrings[i]=date_string_from_day(startDay+i);
-        logmsg("window days="+std::to_string(dayCount)+" workers="+std::to_string(threads));
+        unsigned threads;
+        int64_t windowStart, windowEnd;
+        uint32_t dayCount;
+        std::vector<std::string> dayStrings;
+        {
+            PhaseTimer timer("manifest_setup");
+            fs::create_directories(scratch);
+            fs::create_directories(output/"user_daily");
+            fs::create_directories(output/"campaign_daily");
+            threads=get_threads();
+            auto window=read_window(data/"manifest.json");
+            windowStart=window.first;
+            windowEnd=window.second;
+            dayCount=static_cast<uint32_t>((windowEnd-windowStart)/DAY_MS);
+            dayStrings.resize(dayCount);
+            int64_t startDay=windowStart/DAY_MS;
+            for(uint32_t i=0;i<dayCount;++i) dayStrings[i]=date_string_from_day(startDay+i);
+            logmsg("window days="+std::to_string(dayCount)+" workers="+std::to_string(threads));
+        }
 
         Lookups lookups;
-        read_lookups(data,lookups);
-        logmsg("lookups: products="+std::to_string(lookups.productCategory.size())+
-               " campaigns="+std::to_string(lookups.campaignNames.size())+
-               " categories="+std::to_string(lookups.categories.size()));
+        {
+            PhaseTimer timer("lookup_tables");
+            read_lookups(data,lookups);
+            logmsg("lookups: products="+std::to_string(lookups.productCategory.size())+
+                   " campaigns="+std::to_string(lookups.campaignNames.size())+
+                   " categories="+std::to_string(lookups.categories.size()));
+        }
 
         UserPool users;
         // Links are consumed first, so all components are resolved before any
         // event or click is transformed into a person ID.
         {
+            PhaseTimer timer("links_and_union_find");
             auto maps=map_csv_dir(data/"links");
             uint64_t lines=count_data_lines(maps);
             users.ids.reserve(static_cast<size_t>(std::min<uint64_t>(lines*2+1024,20'000'000)));
@@ -804,6 +842,7 @@ int main() {
         // Event deduplication uses the earliest ingest_ts before validation.
         std::vector<Event> events;
         {
+            PhaseTimer timer("event_parse_dedup_validate");
             auto maps=map_csv_dir(data/"events");
             uint64_t rawCount=count_data_lines(maps);
             logmsg("event input lines="+std::to_string(rawCount));
@@ -858,6 +897,7 @@ int main() {
         std::vector<Click> clicks;
         std::vector<Mapping> clickMappings; // click_id views remain valid through sorting/attribution
         {
+            PhaseTimer timer("click_parse_dedup_validate");
             clickMappings=map_csv_dir(data/"clicks");
             auto& maps=clickMappings;
             uint64_t rawCount=count_data_lines(maps);
@@ -892,32 +932,37 @@ int main() {
             logmsg("valid clicks="+std::to_string(clicks.size()));
         }
 
-                // Resolve all IDs, including unused link IDs, to the byte-wise smallest
+        // Resolve all IDs, including unused link IDs, to the byte-wise smallest
         // member of each transitive component.
-        std::vector<uint32_t> canonical=users.canonical_ids();
-        for (Event& e : events) e.person=canonical[e.person];
-        // The click vector carries raw user indexes until this canonical remap.
-        for (Click& c : clicks) c.person=canonical[c.person];
-        std::vector<uint32_t>().swap(canonical);
-        // No more ID lookups are needed. Keep only the names used in output.
-        users.ids.clear(); users.ids.rehash(0);
-        std::vector<uint32_t>().swap(users.parent);
-        std::vector<uint32_t>().swap(users.sz);
-        std::vector<uint32_t>().swap(users.min_id);
+        std::vector<std::vector<Event>> eventBuckets;
+        std::vector<std::vector<Click>> clickBuckets;
+        {
+            PhaseTimer timer("canonicalize_and_partition");
+            std::vector<uint32_t> canonical=users.canonical_ids();
+            for (Event& e : events) e.person=canonical[e.person];
+            // The click vector carries raw user indexes until this canonical remap.
+            for (Click& c : clicks) c.person=canonical[c.person];
+            std::vector<uint32_t>().swap(canonical);
+            // No more ID lookups are needed. Keep only the names used in output.
+            users.ids.clear(); users.ids.rehash(0);
+            std::vector<uint32_t>().swap(users.parent);
+            std::vector<uint32_t>().swap(users.sz);
+            std::vector<uint32_t>().swap(users.min_id);
 
-        // Bucket by canonical person. All events and clicks for a person land
-        // in the same bucket, so per-bucket sorting/sessionization is independent.
-        std::vector<std::vector<Event>> eventBuckets(BUCKETS);
-        std::vector<std::vector<Click>> clickBuckets(BUCKETS);
-        std::array<size_t,BUCKETS> eventCounts{}, clickCounts{};
-        for (const Event& e : events) ++eventCounts[e.person % BUCKETS];
-        for (const Click& c : clicks) ++clickCounts[c.person % BUCKETS];
-        for (int b=0;b<BUCKETS;++b) { eventBuckets[b].reserve(eventCounts[b]); clickBuckets[b].reserve(clickCounts[b]); }
-        for (Event& e : events) eventBuckets[e.person % BUCKETS].push_back(std::move(e));
-        for (Click& c : clicks) clickBuckets[c.person % BUCKETS].push_back(std::move(c));
-        std::vector<Event>().swap(events);
-        std::vector<Click>().swap(clicks);
-        logmsg("partitioned events and clicks into " + std::to_string(BUCKETS) + " independent buckets");
+            // Bucket by canonical person. All events and clicks for a person land
+            // in the same bucket, so per-bucket sorting/sessionization is independent.
+            eventBuckets.resize(BUCKETS);
+            clickBuckets.resize(BUCKETS);
+            std::array<size_t,BUCKETS> eventCounts{}, clickCounts{};
+            for (const Event& e : events) ++eventCounts[e.person % BUCKETS];
+            for (const Click& c : clicks) ++clickCounts[c.person % BUCKETS];
+            for (int b=0;b<BUCKETS;++b) { eventBuckets[b].reserve(eventCounts[b]); clickBuckets[b].reserve(clickCounts[b]); }
+            for (Event& e : events) eventBuckets[e.person % BUCKETS].push_back(std::move(e));
+            for (Click& c : clicks) clickBuckets[c.person % BUCKETS].push_back(std::move(c));
+            std::vector<Event>().swap(events);
+            std::vector<Click>().swap(clicks);
+            logmsg("partitioned events and clicks into " + std::to_string(BUCKETS) + " independent buckets");
+        }
 
         std::vector<std::vector<CampaignAgg>> bucketAgg(BUCKETS);
         std::atomic<int> next{0};
@@ -945,38 +990,44 @@ int main() {
                 }
             }
         };
-        std::vector<std::thread> pool;
-        for(unsigned i=0;i<threads;++i) pool.emplace_back(worker);
-        for(auto& t:pool) t.join();
-        if(!workerError.empty()) throw std::runtime_error(workerError);
+        {
+            PhaseTimer timer("bucket_sort_sessionize_and_user_aggregate");
+            std::vector<std::thread> pool;
+            for(unsigned i=0;i<threads;++i) pool.emplace_back(worker);
+            for(auto& t:pool) t.join();
+            if(!workerError.empty()) throw std::runtime_error(workerError);
+        }
 
-        // Merge the small campaign/day accumulators from the independent buckets.
-        size_t campaignStride=lookups.campaignNames.size()+1;
-        std::vector<CampaignAgg> totalCampaign(static_cast<size_t>(dayCount)*campaignStride);
-        for(int b=0;b<BUCKETS;++b) {
-            const auto& part=bucketAgg[b];
-            for(size_t i=0;i<part.size();++i) {
-                totalCampaign[i].sessions += part[i].sessions;
-                totalCampaign[i].purchasing += part[i].purchasing;
-                totalCampaign[i].revenue += part[i].revenue;
-                totalCampaign[i].assisted += part[i].assisted;
+        {
+            PhaseTimer timer("campaign_merge_and_write");
+            // Merge the small campaign/day accumulators from the independent buckets.
+            size_t campaignStride=lookups.campaignNames.size()+1;
+            std::vector<CampaignAgg> totalCampaign(static_cast<size_t>(dayCount)*campaignStride);
+            for(int b=0;b<BUCKETS;++b) {
+                const auto& part=bucketAgg[b];
+                for(size_t i=0;i<part.size();++i) {
+                    totalCampaign[i].sessions += part[i].sessions;
+                    totalCampaign[i].purchasing += part[i].purchasing;
+                    totalCampaign[i].revenue += part[i].revenue;
+                    totalCampaign[i].assisted += part[i].assisted;
+                }
             }
-        }
-        std::ofstream campaignOut(scratch/"campaign_daily.csv",std::ios::binary);
-        if(!campaignOut) throw std::runtime_error("cannot create campaign aggregation file");
-        campaignOut << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
-        for(uint32_t day=0;day<dayCount;++day) {
-            for(uint32_t c=0;c<=lookups.campaignNames.size();++c) {
-                const CampaignAgg& a=totalCampaign[static_cast<size_t>(day)*campaignStride+c];
-                if(a.sessions==0 && a.assisted==0) continue;
-                if(c==lookups.campaignNames.size()) campaignOut << "organic,organic,";
-                else campaignOut << lookups.campaignNames[c] << ',' << lookups.channels[c] << ',';
-                campaignOut << dayStrings[day] << ',' << a.sessions << ',' << a.purchasing << ',' << a.revenue << ',' << a.assisted << '\n';
+            std::ofstream campaignOut(scratch/"campaign_daily.csv",std::ios::binary);
+            if(!campaignOut) throw std::runtime_error("cannot create campaign aggregation file");
+            campaignOut << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
+            for(uint32_t day=0;day<dayCount;++day) {
+                for(uint32_t c=0;c<=lookups.campaignNames.size();++c) {
+                    const CampaignAgg& a=totalCampaign[static_cast<size_t>(day)*campaignStride+c];
+                    if(a.sessions==0 && a.assisted==0) continue;
+                    if(c==lookups.campaignNames.size()) campaignOut << "organic,organic,";
+                    else campaignOut << lookups.campaignNames[c] << ',' << lookups.channels[c] << ',';
+                    campaignOut << dayStrings[day] << ',' << a.sessions << ',' << a.purchasing << ',' << a.revenue << ',' << a.assisted << '\n';
+                }
             }
+            campaignOut.flush();
+            if(!campaignOut) throw std::runtime_error("failed writing campaign aggregation file");
+            logmsg("aggregation complete");
         }
-        campaignOut.flush();
-        if(!campaignOut) throw std::runtime_error("failed writing campaign aggregation file");
-        logmsg("aggregation complete");
         return 0;
     } catch(const std::exception& e) {
         std::cerr << "pipeline error: " << e.what() << '\n';

@@ -28,6 +28,12 @@ docker run --rm --network none \
 
 The image installs Polars at build time. The runtime needs no network. All intermediate files are written to `/scratch`; the only final data files are Parquet files under `/output/user_daily/` and `/output/campaign_daily/`.
 
+Each run writes per-phase timings to stderr in `timing phase=<name> elapsed_ms=<milliseconds> status=<completed|failed>` format. The C++ pipeline reports manifest setup, lookups, links, event and click processing, partitioning, bucket processing, campaign aggregation, and total runtime. The converter separately reports output preparation, each Parquet write, cleanup, and total conversion time. Capture the measurements while running the image with:
+
+```bash
+scripts/docker_run.sh /path/to/data /path/to/output 2>timings.log
+```
+
 ## Fixture validation
 
 The C++ core can be run without Docker and without Python packages:
